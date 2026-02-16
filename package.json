@@ -1,0 +1,23 @@
+{
+  "name": "pagespeed-control",
+  "version": "1.0.0",
+  "description": "Lead creation for call center",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "read": "node src/index.js",
+    "test-ai": "node src/test_open_ai.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "crypto": "^1.0.1",
+    "csv-parse": "^6.1.0",
+    "dotenv": "^17.2.4",
+    "openai": "^6.21.0",
+    "p-limit": "^7.3.0",
+    "zod": "^3.25.76"
+  }
+}
