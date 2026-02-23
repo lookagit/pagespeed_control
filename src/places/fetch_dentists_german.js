@@ -3,34 +3,46 @@ import path from 'path';
 import 'dotenv/config';
 
 // ============================================================
-// CONFIGURATION
+// CONFIGURATION LOADING
 // ============================================================
-const CONFIG = {
-  center: { lat: 52.520008, lng: 13.404954 },
-  radius: 2200,
-  keyword: 'zahnarzt',
-  placeType: 'dentist',
-  targetCount: 100,
-  
-  delays: {
+
+function loadConfig() {
+  // Determine config file path: from command line arg --config or env CONFIG_PATH, else default
+  let configPath = process.env.CONFIG_PATH || './config.json';
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--config' && args[i + 1]) {
+      configPath = args[i + 1];
+      break;
+    }
+  }
+
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`❌ Config file not found: ${configPath}`);
+  }
+
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
+  // Validate required fields
+  const required = ['center', 'radius', 'keyword', 'placeType', 'targetCount'];
+  for (const field of required) {
+    if (!config[field]) throw new Error(`Missing required config field: ${field}`);
+  }
+
+  // Apply defaults for optional fields
+  config.grid = config.grid || { steps: 3, latStep: 0.011, lngStep: 0.014 };
+  config.delays = config.delays || {
     betweenPoints: 3000,
     betweenDetails: 180,
     retryBase: 2200,
     overLimitBackoff: 5000,
-  },
-  
-  grid: {
-    steps: 3,
-    latStep: 0.011,
-    lngStep: 0.014,
-  },
-  
-  output: {
-    json: './out/places_berlin_mitte_dentists.json',
-    csv: './out/places_berlin_mitte_dentists.csv',
-  },
-};
+  };
+  config.locationName = config.locationName || `${config.center.lat}_${config.center.lng}`;
 
+  return config;
+}
+
+const CONFIG = loadConfig();
 const API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 if (!API_KEY) throw new Error('❌ Missing GOOGLE_MAPS_API_KEY in .env');
 
@@ -336,9 +348,19 @@ async function fetchAllDetails(placeIds) {
 }
 
 /**
- * Saves results to JSON and CSV files
+ * Saves results to JSON and CSV files (dynamic filenames)
  */
 function saveResults(results) {
+  // Build output filenames based on location name, type, and keyword
+  const safeName = (str) => str.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+  const locationPart = safeName(CONFIG.locationName);
+  const typePart = safeName(CONFIG.placeType);
+  const keywordPart = safeName(CONFIG.keyword);
+
+  const baseFilename = `places_${locationPart}_${typePart}_${keywordPart}`;
+  const jsonPath = path.join('./out', `${baseFilename}.json`);
+  const csvPath = path.join('./out', `${baseFilename}.csv`);
+
   const outputMeta = {
     timestamp: new Date().toISOString(),
     config: {
@@ -352,20 +374,20 @@ function saveResults(results) {
     count: results.length,
   };
 
-  writeJson(CONFIG.output.json, { ...outputMeta, results });
-  writeCsv(CONFIG.output.csv, results);
+  writeJson(jsonPath, { ...outputMeta, results });
+  writeCsv(csvPath, results);
 
   console.log('\n📁 Files saved:');
-  console.log(`   - ${CONFIG.output.json}`);
-  console.log(`   - ${CONFIG.output.csv}`);
-  console.log(`✅ Done. Collected ${results.length} dentists.`);
+  console.log(`   - ${jsonPath}`);
+  console.log(`   - ${csvPath}`);
+  console.log(`✅ Done. Collected ${results.length} places.`);
 }
 
 // ============================================================
 // MAIN
 // ============================================================
 async function main() {
-  console.log('🚀 Starting dentist collection in Berlin Mitte...\n');
+  console.log('🚀 Starting Google Places collection...\n');
 
   try {
     // 1. Validate API key

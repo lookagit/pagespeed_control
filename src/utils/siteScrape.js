@@ -175,24 +175,6 @@ function isSameDomain(baseUrl, targetUrl) {
   }
 }
 
-// ============================================================
-// ARRAY UTILITIES
-// ============================================================
-
-/**
- * Removes duplicates and empty values from array
- * 
- * @template T
- * @param {T[]} array - Input array
- * @returns {string[]} Unique non-empty values
- */
-function unique(array) {
-  return [...new Set(
-    (array || [])
-      .map(item => String(item || "").trim())
-      .filter(Boolean)
-  )];
-}
 
 // ============================================================
 // HTTP FETCHING
@@ -381,20 +363,67 @@ function extractAttributeArray($, selector, attribute) {
   );
 }
 
-// ============================================================
-// EMAIL EXTRACTION
-// ============================================================
-
 /**
- * Extracts email addresses from text using regex
- * 
- * @param {string} text - Text to search
- * @returns {string[]} Array of unique email addresses
+ * Enhanced email extraction from HTML/text.
+ * Handles HTML entities, obfuscation, and mailto: links.
+ *
+ * @param {string} html - HTML or plain text content
+ * @returns {string[]} Array of unique, normalized email addresses
  */
-function extractEmailsFromText(text) {
-  const emailPattern = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
-  const matches = text.match(emailPattern) || [];
-  return unique(matches);
+function extractEmailsFromText(html) {
+  if (!html) return [];
+
+  let text = html;
+
+  // 1. Decode HTML entities (basic & numeric)
+  const decodeHtmlEntities = (str) => {
+    return str.replace(/&#(\d+);/g, (match, dec) => String.fromCharCode(dec))
+              .replace(/&#x([0-9A-Fa-f]+);/g, (match, hex) => String.fromCharCode(parseInt(hex, 16)))
+              .replace(/&amp;/g, '&')
+              .replace(/&lt;/g, '<')
+              .replace(/&gt;/g, '>')
+              .replace(/&quot;/g, '"')
+              .replace(/&#39;/g, "'")
+              .replace(/&nbsp;/g, ' ');
+  };
+  text = decodeHtmlEntities(text);
+
+  // 2. Replace common email obfuscations (case‑insensitive)
+  const obfuscationPatterns = [
+    { pattern: /\s*\[?at\]?\s*/gi, replacement: '@' },
+    { pattern: /\s*\(?at\)?\s*/gi, replacement: '@' },
+    { pattern: /\s*\[?dot\]?\s*/gi, replacement: '.' },
+    { pattern: /\s*\(?dot\)?\s*/gi, replacement: '.' },
+    { pattern: /\s*\[?@\]?\s*/gi, replacement: '@' }, // sometimes [@]
+  ];
+  obfuscationPatterns.forEach(({ pattern, replacement }) => {
+    text = text.replace(pattern, replacement);
+  });
+
+  // 3. Extract emails from mailto: links (even if href is encoded)
+  const mailtoRegex = /mailto:([^"'&\s?]+)/gi;
+  let mailtoMatches = [];
+  let match;
+  while ((match = mailtoRegex.exec(text)) !== null) {
+    mailtoMatches.push(decodeURIComponent(match[1]));
+  }
+
+  // 4. Extract emails from plain text using improved regex
+  //    This regex covers 99% of real‑world emails (local part allows +, etc.)
+  const emailRegex = /[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}/g;
+  const textMatches = text.match(emailRegex) || [];
+
+  // 5. Combine all candidates, normalize (lowercase, trim) and deduplicate
+  const allEmails = [...mailtoMatches, ...textMatches]
+    .map(email => email.trim().toLowerCase())
+    .filter(email => email.includes('@') && email.includes('.')); // basic sanity
+
+  return [...new Set(allEmails)];
+}
+
+// Helper to keep your original style
+function unique(arr) {
+  return [...new Set(arr)];
 }
 
 // ============================================================

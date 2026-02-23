@@ -1,16 +1,23 @@
 import fs from "fs";
-import OpenAI from "openai";
+import { OpenAI } from "openai"; // OpenAI SDK (DeepSeek compatible)
 import { writeFileSafe } from "../utils/writeFileSafe.js";
+import "dotenv/config";
+import { ENGINES } from "./strict.js";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// DeepSeek client (OpenAI‑compatible)
+const deepseek = new OpenAI({
+  apiKey: process.env.DEEP_SEEK_API_KEY,
+  baseURL: "https://api.deepseek.com/v1",
+});
 
-// CSV escaping (ClickUp import voli polja pod navodnicima, sa dupliranjem " u tekstu)
+// CSV escaping (ClickUp import expects quoted fields with double quotes escaped)
 function csvEscape(value) {
   const s = String(value ?? "");
   const escaped = s.replace(/"/g, '""');
   return `"${escaped}"`;
 }
 
+// Updated system prompt – email templates removed
 const SYSTEM_PROMPT = `TI SI “ClickUp Lead Pack Builder” za B2B prodaju (dental klinike u Nemačkoj).
 Ulaz je jedan JSON lead pack (podaci + emaili + tehničke tačke + upsell + followup + site_report).
 
@@ -29,7 +36,6 @@ PRAVILA:
 - Tehničke stvari napiši kratko i u brojkama gde postoje (JS KiB, CSS KiB, mobile/desktop score, load time).
 - Sve što je na ENG (npr. upsell “why_now/trigger/proof/next_step”) prevedi na SR u description-u.
 - DELIMIČNO: Call Script, kvalifikaciona pitanja i objection handling moraju biti na NEMAČKOM (DE). Ostalo je na SR.
-- Email (DE) i Email (SR) ubaci kao “copy/paste” (bez bulletova u samom emailu).
 
 FORMAT description-a (tačno ovim redosledom, jasni naslovi):
 1) LEAD KARTICA (Naziv, Adresa, Telefon, Web, Email, Izvor)
@@ -39,14 +45,13 @@ FORMAT description-a (tačno ovim redosledom, jasni naslovi):
 5) 5 KVALIFIKACIONIH PITANJA (DE)
 6) KAKO ODGOVORITI NA PRIGOVORE (DE) (4–6 tipičnih)
 7) SLEDEĆI KORACI (SR)
-8) EMAIL ŠABLON (DE)
-9) EMAIL ŠABLON (SR)
-10) SEKVENCA NAKNADNOG PRAĆENJA (SR) (iz followup_sequence)
-11) KONTROLNA LISTA (SR) (checkbox linije)
-12) DODATNE USLUGE (UPSELL) (SR) – sa “Zašto sada / Okidač / Dokaz / Sledeći korak”
-`;
+8) SEKVENCA NAKNADNOG PRAĆENJA (SR) (iz followup_sequence)
+9) KONTROLNA LISTA (SR) (checkbox linije)
+10) DODATNE USLUGE (UPSELL) (SR) – sa “Zašto sada / Okidač / Dokaz / Sledeći korak”
 
-// JSON schema za izlaz (Structured Outputs)
+TVOJ ODGOVOR MORA BITI ISKLJUČIVO VALIDAN JSON OBJEKAT, BEZ DODATNOG TEKSTA ILI OZNAKA.`;
+
+// JSON schema for the output (used for validation, optional)
 const OUTPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -60,44 +65,71 @@ const OUTPUT_SCHEMA = {
   required: ["task_name", "status", "priority", "tags", "description"],
 };
 
+/**
+ * Simple JSON validation against a JSON schema (optional).
+ * You can install `ajv` for full validation, but here we only check required fields.
+ */
+function validateOutput(obj) {
+  const required = OUTPUT_SCHEMA.required;
+  for (const field of required) {
+    if (!(field in obj)) {
+      throw new Error(`Missing required field: ${field}`);
+    }
+  }
+  if (obj.status !== "New Lead") obj.status = "New Lead"; // enforce
+  if (obj.priority !== "High") obj.priority = "High";
+  return obj;
+}
+
 export async function leadPackToClickUpCsv(leadPackJson, outPath = "./out/clickup/clickup_import.csv") {
-  const response = await client.responses.create({
-    model: "gpt-5.2",
-    input: [
+  const response = await deepseek.chat.completions.create({
+    model: ENGINES.REASONING, // or use ENGINES.SMART from your config
+    messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: JSON.stringify(leadPackJson) },
     ],
-    // po želji: verbosity "high" ako želiš još “punije” opise
-    text: {
-      verbosity: "high",
-      format: {
-        type: "json_schema",
-        name: "clickup_task",
-        strict: true,
-        schema: OUTPUT_SCHEMA,
-      },
-    },
-    // ako ti description ume da bude ogroman, podigni ovo
-    max_output_tokens: 6000,
+    max_tokens: 6000,
+    temperature: 0, // deterministic
+    response_format: { type: "json_object" },
   });
 
-  // Structured output se dobija kao JSON string u output_text
-  const out = JSON.parse(response.output_text);
+  const content = response.choices[0]?.message?.content;
+  if (!content) {
+    throw new Error("Empty response from DeepSeek API");
+  }
 
+  // Parse JSON (DeepSeek JSON mode should return valid JSON)
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (e) {
+    // Fallback: attempt to extract JSON from the response
+    const firstBrace = content.indexOf('{');
+    const lastBrace = content.lastIndexOf('}');
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+      throw new Error(`Could not extract JSON from response: ${content.substring(0, 200)}...`);
+    }
+    const extracted = content.substring(firstBrace, lastBrace + 1);
+    parsed = JSON.parse(extracted);
+  }
+
+  // Optional validation
+  const out = validateOutput(parsed);
+
+  // Build CSV
   const header = "Task Name,Description,Status,Priority,Tags\n";
-  const row =
-    [
-      csvEscape(out.task_name),
-      csvEscape(out.description),
-      csvEscape(out.status),
-      csvEscape(out.priority),
-      csvEscape(out.tags),
-    ].join(",") + "\n";
+  const row = [
+    csvEscape(out.task_name),
+    csvEscape(out.description),
+    csvEscape(out.status),
+    csvEscape(out.priority),
+    csvEscape(out.tags),
+  ].join(",") + "\n";
 
-    console.log("Generated ClickUp Task:", header);
-    console.log("Generated ClickUp Task:", row);
+  console.log("Generated ClickUp Task:", header);
+  console.log("Generated ClickUp Task:", row);
 
-    writeFileSafe(outPath, header + row);
+  await writeFileSafe(outPath, header + row);
 
-    return { outPath, ...out };
+  return { outPath, ...out };
 }

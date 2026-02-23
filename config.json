@@ -1,0 +1,19 @@
+{
+  "locationName": "sydney_dentists",
+  "center": { "lat": -33.8688, "lng": 151.2093 },
+  "radius": 4000,
+  "keyword": "dentist",
+  "placeType": "dentist",
+  "targetCount": 150,
+  "grid": {
+    "steps": 3,
+    "latStep": 0.02,
+    "lngStep": 0.024
+  },
+  "delays": {
+    "betweenPoints": 3000,
+    "betweenDetails": 200,
+    "retryBase": 2200,
+    "overLimitBackoff": 5000
+  }
+}
