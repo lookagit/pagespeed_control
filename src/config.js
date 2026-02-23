@@ -1,7 +1,7 @@
 import "dotenv/config";
 
 export const CONFIG = {
-  LEADS_CSV: process.env.LEADS_CSV || "./out/places_berlin_mitte_dentists.csv",
+  LEADS_CSV: process.env.LEADS_CSV || "./out/places_melbourne_aesthetic_surgery_doctor_plastic_surgery_cosmetic_clinic_laser_clinic.csv",
   PSI_API_KEY: process.env.PSI_API_KEY,
   CRUX_API_KEY: process.env.CRUX_API_KEY,
   OUT_DIR: "./out",

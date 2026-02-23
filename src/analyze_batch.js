@@ -159,19 +159,27 @@ async function processFile(fileInfo, options) {
       throw new Error("Missing lead.website_url");
     }
 
-    // 3) Analyze lead (LLM)
-    const analysis = await withRetries(
-      () => analyzeLeadStrict(leadContext),
-      "analyzeLeadStrict"
-    );
-    console.log("✅ Lead analysis complete");
+  const { mobile, desktop } = leadContext.pagespeed ?? {};
+  const { categories, lab } = mobile ?? {};
+  const { categories: categoriesDesktop, lab: labDesktop } = desktop ?? {};
+  
+  const analysis = await withRetries(
+    () => analyzeLeadStrict({
+      mobile: { categories, lab },
+      desktop: { categories: categoriesDesktop, lab: labDesktop },
+      signals: leadContext?.signals ?? {},
+      stack: leadContext?.stack ?? {}, 
+      lead: leadContext?.lead ?? {},
+    }),
+    "analyzeLeadStrict"
+  );
+  console.log("✅ Lead analysis complete");
 
-    // 4) Scrape website
-    const scrapedTokens = await withRetries(
-      () => scrapeSiteSnapshot(websiteUrl),
-      "scrapeSiteSnapshot"
-    );
-    console.log("✅ Website scraped");
+  const scrapedTokens = await withRetries(
+    () => scrapeSiteSnapshot(websiteUrl),
+    "scrapeSiteSnapshot"
+  );
+  console.log("✅ Website scraped");
 
     // 5) Summarize scraped content
     const siteSummary = await withRetries(
