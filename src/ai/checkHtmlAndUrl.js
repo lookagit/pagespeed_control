@@ -1,40 +1,55 @@
-// src/ai/checkHtmlAndUrl.js
-import { Site10Schema } from "./schemas.js";
-import { callStrictJson, ENGINES } from "./strict.js";
+// ============================================================
+// ai/checkHtmlAndUrl.js - Sumarizacija sadržaja sajta
+// ============================================================
 
-function clampTokens(tokens, maxLen = 3500) {
-  if (!tokens) return "";
-  const s = typeof tokens === "string" ? tokens : JSON.stringify(tokens);
-  return s.length > maxLen ? s.slice(0, maxLen) : s;
-}
+import OpenAI from "openai";
+import { CONFIG } from "../config.js";
 
-export async function summarizeSiteTo10({ url, tokens }) {
-  const compactTokens = clampTokens(tokens, 3500);
+const deepseek = new OpenAI({
+  apiKey:  CONFIG.DEEPSEEK_API_KEY,
+  baseURL: "https://api.deepseek.com",
+});
 
-  return callStrictJson({
-    schema: Site10Schema,
-    schemaName: "site_summary_10",
-    model: ENGINES.REASONING,               // ✅ gpt-4o-mini (mnogo jeftinije)
-    max_output_tokens: 650,            // ✅ limitira cenu (10 rečenica + par polja)
-    prompt_cache_key: "dentals:site10:v2", // ✅ bolji cache u batch-u
-    system: [
-      "Ti si auditor web-sajta za lead research.",
-      "Ulaz je scraped 'tokens' tekst + URL kao referenca (ne smeš da izmišljaš ništa van tokena).",
-      "",
-      "Zadatak:",
-      "1) Napiši TAČNO 10 rečenica (srpski, latinica) sa 10 najvažnijih informacija iz tokena.",
-      "2) Proceni modernost sajta (modern/outdated/mixed/unknown) sa confidence 0–1 i 2–5 razloga.",
-      "3) Izvuci kontakte i ključne stvari u 'extracted' (email/phone/address/vendor/legal hints).",
-      "",
-      "Pravila:",
-      "- Ne koristi bulletove i ne numeriši rečenice.",
-      "- Ne izmišljaj email/telefon/adresu ako nije eksplicitno u tokenima.",
-      "- Ako nešto nije prisutno, vrati null ili prazno polje.",
-      "- Budi kratak: svaka rečenica maksimalno ~120 karaktera.",
-    ].join("\n"),
-    data: {
-      url,
-      tokens: compactTokens,
-    },
+/**
+ * Uzima scrape-ovani tekst sajta i vraća strukturirani sažetak.
+ * @param {object} params
+ * @param {string} params.url     - URL sajta
+ * @param {string} params.tokens  - Scraped tekst sajta
+ */
+export async function summarizeSite({ url, tokens }) {
+  if (!tokens || tokens.length < 50) {
+    return { summary: "Nije bilo moguće pročitati sadržaj sajta.", services: [], tone: "unknown" };
+  }
+
+  const prompt = `Analiziraj sadržaj ovog sajta i odgovori ISKLJUČIVO validnim JSON objektom.
+
+URL: ${url}
+
+SADRŽAJ SAJTA (prvih ~3000 karaktera):
+${tokens.slice(0, 3000)}
+
+Odgovori ovim JSON oblikom (bez markdowna, bez objašnjenja):
+{
+  "summary": "<2-3 rečenice: čime se bavi biznis>",
+  "services": ["<usluga 1>", "<usluga 2>"],
+  "tone": "<professional | outdated | modern | minimal | cluttered>",
+  "has_online_booking": <true | false>,
+  "has_testimonials": <true | false>,
+  "has_team_page": <true | false>,
+  "languages": ["<jezik>"],
+  "notable": "<jedna napomena o sajtu ako postoji>"
+}`;
+
+  const response = await deepseek.chat.completions.create({
+    model: "deepseek-chat",
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.2,
+    max_tokens: 400,
   });
+
+  const raw = response.choices[0]?.message?.content?.trim() ?? "";
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return { summary: raw, services: [], tone: "unknown" };
+
+  return JSON.parse(jsonMatch[0]);
 }

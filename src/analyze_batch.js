@@ -1,260 +1,209 @@
-// src/analyze_batch.js
-// Batch runner: reads ./out/*.json and runs the SAME pipeline as analyze_one
-// Usage:
+// ============================================================
+// analyze_batch.js - STAGE 2: AI Analiza leadova
+// ============================================================
+// Ulaz : out/*.json (output Stage 1)
+// Izlaz: out/final/{basename}.json
+//        out/report/{basename}.csv
+//
+// Pokretanje:
 //   node src/analyze_batch.js
 //   node src/analyze_batch.js --force
+// ============================================================
 
 import fs from "fs";
 import path from "path";
-
+import { CONFIG } from "./config.js";
 import { readJson } from "./io/readJson.js";
-import { writeJson } from "./io/writeJson.js";
-
-import { analyzeLeadStrict } from "./ai/analyzeLead.js";
-import { buildLeadPack } from "./ai/buildLeadPack.js";
-
+import { writeJson } from "./io/write.js";
+import { sleep, withRetries } from "./utils/helpers.js";
+import { analyzeLeadWithDeepSeek } from "./ai/analyzeLead.js";
 import { scrapeSiteSnapshot } from "./utils/siteScrape.js";
-import { summarizeSiteTo10 } from "./ai/checkHtmlAndUrl.js";
+import { summarizeSite } from "./ai/checkHtmlAndUrl.js";
+import { buildLeadPack } from "./ai/buildLeadPack.js";
+import { leadPackToCsv } from "./ai/createFinalReport.js";
+import { enrichLead } from "./ai/enrichLead.js";
 
-import { leadPackToClickUpCsv } from "./ai/createFinalReport.js";
+// ─────────────────────────────────────────────────────────────
+// DISCOVERY
+// ─────────────────────────────────────────────────────────────
 
-// -------------------- CONFIG --------------------
-const INPUT_DIR = "./out";
-const FINAL_DIR = "./out/final";
-const CLICKUP_DIR = "./out/clickup";
+function findRawLeadFiles() {
+  fs.mkdirSync(CONFIG.OUT_DIR, { recursive: true });
 
-const MAX_RETRIES = 2;
-const DELAY_BETWEEN_MS = 1200;
-
-// -------------------- UTILS --------------------
-function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true });
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function discoverOutJsonFiles() {
-  ensureDir(INPUT_DIR);
-
-  const entries = fs.readdirSync(INPUT_DIR, { withFileTypes: true });
-
-  return entries
-    .filter((e) => e.isFile())
-    .map((e) => e.name)
-    .filter((name) => name.endsWith(".json"))
-    // izbegni slučajno final/clickup summary fajlove ako ih ima u root out/
-    .filter((name) => !name.endsWith(".error.json"))
-    .filter((name) => !name.startsWith("_"))
-    .map((filename) => {
-      const filepath = path.join(INPUT_DIR, filename);
-      const basename = path.basename(filename, ".json");
-      return { filename, filepath, basename };
-    });
+  return fs
+    .readdirSync(CONFIG.OUT_DIR, { withFileTypes: true })
+    .filter(e => e.isFile() && e.name.endsWith(".json"))
+    .filter(e => !e.name.endsWith(".error.json"))
+    .filter(e => !e.name.startsWith("_"))
+    .map(e => ({
+      filename: e.name,
+      filepath: path.join(CONFIG.OUT_DIR, e.name),
+      basename: path.basename(e.name, ".json"),
+    }));
 }
 
 function isAlreadyAnalyzed(basename) {
-  const outPath = path.join(FINAL_DIR, `${basename}.json`);
-  return fs.existsSync(outPath);
+  return fs.existsSync(path.join(CONFIG.FINAL_DIR, `${basename}.json`));
 }
 
-// isto kao u analyze_one
-function prepareLeadContext(item) {
-  return {
-    lead: item.lead,
-    pagespeed: item.pagespeed,
-    crux: item.crux ?? null,
-    signals: item.signals ?? null,
-    stack: item.stack ?? null,
-    snapshot: item.snapshot ?? null,
-  };
-}
+// ─────────────────────────────────────────────────────────────
+// OBRADA JEDNOG FAJLA
+// ─────────────────────────────────────────────────────────────
 
-async function withRetries(fn, label) {
-  let lastErr = null;
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 1) {
-        console.log(`   🔁 retry ${attempt}/${MAX_RETRIES} (${label})...`);
-      }
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      console.log(`   ⚠️  ${label} failed: ${err?.message || err}`);
-      if (attempt < MAX_RETRIES) await sleep(DELAY_BETWEEN_MS);
-    }
-  }
-
-  throw lastErr;
-}
-
-async function saveOutputsByBasename(basename, leadPack) {
-  ensureDir(FINAL_DIR);
-  ensureDir(CLICKUP_DIR);
-
-  const jsonPath = path.join(FINAL_DIR, `${basename}.json`);
-  const csvPath = path.join(CLICKUP_DIR, `${basename}.csv`);
-
-  writeJson(jsonPath, leadPack);
-  await leadPackToClickUpCsv(leadPack, csvPath);
-
-  return { jsonPath, csvPath };
-}
-
-async function saveErrorPack(basename, itemOrNull, err) {
-  ensureDir(FINAL_DIR);
-
-  const errorPath = path.join(FINAL_DIR, `${basename}.error.json`);
-  const errorPack = {
-    lead: itemOrNull?.lead || {},
-    error: {
-      message: err?.message || String(err),
-      stack: err?.stack || null,
-      timestamp: new Date().toISOString(),
-    },
-    raw_item: itemOrNull || null,
-  };
-
-  writeJson(errorPath, errorPack);
-  return errorPath;
-}
-
-// -------------------- CORE --------------------
 async function processFile(fileInfo, options) {
   const { filename, filepath, basename } = fileInfo;
 
-  console.log("\n" + "─".repeat(70));
+  console.log("\n" + "─".repeat(60));
   console.log(`📄 ${filename}`);
 
-  // skip if already analyzed
   if (!options.force && isAlreadyAnalyzed(basename)) {
-    console.log("⏭️  Skipped (already analyzed). Use --force to re-run.");
+    console.log("⏭️  Već analiziran. --force za ponovnu analizu.");
     return { status: "skipped" };
   }
 
   let data = null;
 
   try {
-    // 1) Load input data
+    // 1. Učitaj Stage 1 podatke
     data = readJson(filepath);
-
-    if (!data?.item) {
-      throw new Error("Invalid file format: missing data.item");
-    }
-
+    if (!data?.item) throw new Error("Neispravan format fajla: nedostaje data.item");
     if (data.item?.status === "failed") {
-      console.log("⏭️  Skipped (Stage 1 status=failed).");
+      console.log("⏭️  Preskočen (Stage 1 = failed).");
       return { status: "skipped" };
     }
 
-    console.log("✅ Input loaded");
+    const { item } = data;
+    const url = item.lead?.website_url;
+    if (!url) throw new Error("Nedostaje lead.website_url");
 
-    // 2) Prepare lead context
-    const leadContext = prepareLeadContext(data.item);
-    const websiteUrl = leadContext?.lead?.website_url;
+    console.log(`🌐 ${url}`);
 
-    if (!websiteUrl) {
-      throw new Error("Missing lead.website_url");
+    // 2. Scrape sajta PRVO — rezultat ide i u AI analizu i u sumarizaciju
+    const scrapeResult = await withRetries(
+      () => scrapeSiteSnapshot(url),
+      "Scrape sajta",
+      CONFIG.MAX_RETRIES
+    );
+
+    if (!scrapeResult.ok) {
+      console.log(`⚠️  Scrape neuspešan: ${scrapeResult.error}`);
+    } else {
+      console.log(`✅ Scrape: ${scrapeResult.extraPages?.length ?? 0} extra stranica`);
     }
 
-  const { mobile, desktop } = leadContext.pagespeed ?? {};
-  const { categories, lab } = mobile ?? {};
-  const { categories: categoriesDesktop, lab: labDesktop } = desktop ?? {};
-  
-  const analysis = await withRetries(
-    () => analyzeLeadStrict({
-      mobile: { categories, lab },
-      desktop: { categories: categoriesDesktop, lab: labDesktop },
-      signals: leadContext?.signals ?? {},
-      stack: leadContext?.stack ?? {}, 
-      lead: leadContext?.lead ?? {},
-    }),
-    "analyzeLeadStrict"
-  );
-  console.log("✅ Lead analysis complete");
-
-  const scrapedTokens = await withRetries(
-    () => scrapeSiteSnapshot(websiteUrl),
-    "scrapeSiteSnapshot"
-  );
-  console.log("✅ Website scraped");
-
-    // 5) Summarize scraped content
-    const siteSummary = await withRetries(
-      () => summarizeSiteTo10({ url: websiteUrl, tokens: scrapedTokens }),
-      "summarizeSiteTo10"
+    // 3. AI analiza — koristi i scrapeBase za bogatiji kontekst
+    const analysis = await withRetries(
+      () => analyzeLeadWithDeepSeek({
+        lead:       item.lead,
+        mobile:     item.pagespeed?.mobile,
+        desktop:    item.pagespeed?.desktop,
+        signals:    item.signals   ?? {},
+        stack:      item.stack     ?? {},
+        scrapeBase: scrapeResult?.base ?? null,
+      }),
+      "AI analiza",
+      CONFIG.MAX_RETRIES
     );
-    console.log("✅ Site summary generated");
+    console.log(`✅ AI analiza: skor=${analysis.score}/100 | prioritet=${analysis.priority}`);
 
-    // 6) Build final lead pack
+    // 4. Sumiraj sadržaj sajta (tokens = LLM-ready string iz scrape-a)
+    const siteSummary = scrapeResult.ok
+      ? await withRetries(
+          () => summarizeSite({ url, tokens: scrapeResult.tokens }),
+          "Sumarizacija sajta",
+          CONFIG.MAX_RETRIES
+        )
+      : { summary: "Sajt nije bio dostupan.", services: [], tone: "unknown" };
+
+    console.log("✅ Sajt sumarizovan");
+
+    // 5. Složi finalni lead pack
     const leadPack = await withRetries(
-      () =>
-        buildLeadPack({
-          lead: data.item.lead,
-          analysis,
-          siteScrape: siteSummary,
-        }),
-      "buildLeadPack"
+      () => buildLeadPack({ lead: item.lead, analysis, siteSummary }),
+      "Build lead pack",
+      CONFIG.MAX_RETRIES
     );
-    console.log("✅ Lead pack built");
+    console.log("✅ Lead pack kreiran");
 
-    // 7) Save outputs (use same basename as input file)
-    const { jsonPath, csvPath } = await saveOutputsByBasename(basename, leadPack);
+    // 6. Enrichment — mali fokusirani AI pozivi (cold email, ponuda, SWOT, report nota...)
+    const enrichedPack = await withRetries(
+      () => enrichLead({ leadPack, analysis, item }),
+      "Enrichment",
+      CONFIG.MAX_RETRIES
+    );
+    console.log("✅ Enrichment završen");
+
+    // 7. Sačuvaj izlaze
+    fs.mkdirSync(CONFIG.FINAL_DIR, { recursive: true });
+    fs.mkdirSync(CONFIG.REPORT_DIR, { recursive: true });
+
+    const jsonPath = path.join(CONFIG.FINAL_DIR, `${basename}.json`);
+    const csvPath  = path.join(CONFIG.REPORT_DIR, `${basename}.csv`);
+
+    writeJson(jsonPath, enrichedPack);
+    await leadPackToCsv(enrichedPack, csvPath);
+
     console.log(`💾 JSON: ${jsonPath}`);
-    console.log(`📊 CSV : ${csvPath}`);
+    console.log(`📊 CSV:  ${csvPath}`);
 
     return { status: "success" };
+
   } catch (err) {
-    console.log(`❌ Error: ${err?.message || err}`);
-    const errorPath = await saveErrorPack(basename, data?.item || null, err);
-    console.log(`🧾 Error saved: ${errorPath}`);
+    console.log(`❌ Greška: ${err?.message || err}`);
+
+    fs.mkdirSync(CONFIG.FINAL_DIR, { recursive: true });
+    const errorPath = path.join(CONFIG.FINAL_DIR, `${basename}.error.json`);
+    writeJson(errorPath, {
+      lead:      data?.item?.lead ?? {},
+      error:     { message: err?.message, stack: err?.stack },
+      timestamp: new Date().toISOString(),
+    });
+
     return { status: "failed" };
   } finally {
-    await sleep(DELAY_BETWEEN_MS);
+    await sleep(CONFIG.DELAY_MS);
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────────────────────────
+
 async function main() {
-  const args = process.argv.slice(2);
-  const options = { force: args.includes("--force") || args.includes("-f") };
+  const args  = process.argv.slice(2);
+  const force = args.includes("--force") || args.includes("-f");
 
-  ensureDir(FINAL_DIR);
-  ensureDir(CLICKUP_DIR);
+  console.log("\n🚀 STAGE 2: AI ANALIZA LEADOVA\n");
+  if (force) console.log("🔄 Force mode: ponavljam sve\n");
 
-  const files = discoverOutJsonFiles();
+  const files = findRawLeadFiles();
 
   if (!files.length) {
-    console.log(`❌ No JSON files found in ${INPUT_DIR}/`);
+    console.log(`❌ Nema JSON fajlova u ${CONFIG.OUT_DIR}/`);
+    console.log("   Pokreni prvo: node src/index.js");
     process.exit(1);
   }
 
-  console.log(`🚀 Batch analysis starting: ${files.length} files`);
-  if (options.force) console.log("🔄 Force mode ON (re-analyze all)");
+  console.log(`📦 Pronađeno fajlova: ${files.length}`);
 
-  let ok = 0,
-    failed = 0,
-    skipped = 0;
+  let ok = 0, failed = 0, skipped = 0;
 
   for (const f of files) {
-    const res = await processFile(f, options);
+    const res = await processFile(f, { force });
     if (res.status === "success") ok++;
-    if (res.status === "failed") failed++;
-    if (res.status === "skipped") skipped++;
+    else if (res.status === "failed") failed++;
+    else skipped++;
   }
 
-  console.log("\n" + "=".repeat(70));
-  console.log("✅ BATCH DONE");
-  console.log(`✅ success: ${ok}`);
-  console.log(`⏭️  skipped: ${skipped}`);
-  console.log(`❌ failed : ${failed}`);
-  console.log(`📁 final  : ${FINAL_DIR}`);
-  console.log(`📁 clickup: ${CLICKUP_DIR}`);
-  console.log("=".repeat(70) + "\n");
+  console.log("\n" + "=".repeat(60));
+  console.log("✅ STAGE 2 ZAVRŠEN");
+  console.log(`   Uspešno: ${ok} | Neuspešno: ${failed} | Preskočeno: ${skipped}`);
+  console.log(`   JSON:    ${CONFIG.FINAL_DIR}/`);
+  console.log(`   CSV:     ${CONFIG.REPORT_DIR}/`);
+  console.log("=".repeat(60) + "\n");
 }
 
-main().catch((err) => {
-  console.error("❌ Fatal:", err?.message || err);
+main().catch(e => {
+  console.error("❌ Fatalna greška:", e?.message || e);
   process.exit(1);
 });
