@@ -1,7 +1,7 @@
 // ============================================================
 // analyze_batch.js - STAGE 2: AI Analiza leadova
 // ============================================================
-// Ulaz : out/*.json (output Stage 1)
+// Ulaz : out/*.json (call report iz pagespeed-reporter.js)
 // Izlaz: out/final/{basename}.json
 //        out/report/{basename}.csv
 //
@@ -61,21 +61,106 @@ async function processFile(fileInfo, options) {
     return { status: "skipped" };
   }
 
-  let data = null;
+  let callReport = null;
 
   try {
-    // 1. Učitaj Stage 1 podatke
-    data = readJson(filepath);
-    if (!data?.item) throw new Error("Neispravan format fajla: nedostaje data.item");
-    if (data.item?.status === "failed") {
-      console.log("⏭️  Preskočen (Stage 1 = failed).");
-      return { status: "skipped" };
+    // 1. Učitaj Stage 1 podatke — podržavamo oba formata:
+    //    A) Novi: flat call report  { name, website_url, scores, tracking, ... }
+    //    B) Stari: wrapped format   { item: { lead: { website_url }, pagespeed, signals, ... } }
+    const raw = readJson(filepath);
+
+    if (raw?.website_url) {
+      // Format A — novi flat call report
+      callReport = raw;
+    } else if (raw?.item?.lead?.website_url) {
+      // Format B — stari wrapped format, konvertuj u call report strukturu
+      const item = raw.item;
+      const lead = item.lead;
+
+      if (item.status === "failed") {
+        console.log("⏭️  Preskočen (Stage 1 = failed).");
+        return { status: "skipped" };
+      }
+
+      const ps = item.pagespeed || {};
+      const sig = item.signals  || {};
+      const t   = sig.tracking  || {};
+      const b   = sig.booking   || {};
+      const seo = sig.seo       || {};
+      const stk = item.stack    || {};
+
+      // Normalizuj u flat strukturu kompatibilnu sa novim kodom
+      callReport = {
+        name:          lead.name,
+        website_url:   lead.website_url,
+        address:       lead.address ?? null,
+        processed_at:  item.processed_at ?? null,
+        health_score:  null,
+        health_grade:  null,
+
+        phones:             item.contact_summary?.phones ?? [],
+        emails:             item.contact_summary?.emails ?? [],
+        has_online_booking: !!(b.type && b.type !== "unknown"),
+        booking_type:       b.type   ?? "unknown",
+        booking_vendor:     b.vendor ?? null,
+        ctas:               [],
+
+        seo: seo ? {
+          has_title:            !!seo.title,
+          title:                seo.title ?? null,
+          has_meta_description: !!(seo.meta_description),
+          has_canonical:        !!(seo.canonical),
+          has_open_graph:       !!(seo.open_graph?.og_title),
+          has_twitter_card:     !!(seo.twitter_card?.twitter_card),
+          h1_count:             seo.content_analysis?.h1_count ?? null,
+          h1_text:              seo.content_analysis?.h1_text  ?? null,
+          word_count:           seo.content_analysis?.word_count ?? null,
+          image_count:          seo.content_analysis?.image_count ?? null,
+          images_without_alt:   seo.content_analysis?.images_without_alt ?? null,
+          has_structured_data:  !!(seo.structured_data?.length),
+          structured_data_type: seo.structured_data?.[0]?.["@type"] ?? null,
+          has_https_forms:      !!(seo.security?.has_https_forms),
+          has_lazy_loading:     !!(seo.performance_hints?.has_lazy_loading),
+          has_async_scripts:    !!(seo.performance_hints?.has_async_scripts),
+        } : null,
+
+        tracking: {
+          has_ga4:        t.ga4         ?? false,
+          has_gtm:        t.gtm         ?? false,
+          has_meta_pixel: t.meta_pixel  ?? false,
+          has_google_ads: t.google_ads  ?? false,
+          has_chatbot:    !!(sig.chatbot?.has_chatbot),
+          chatbot_vendor: sig.chatbot?.vendor ?? null,
+        },
+
+        scores: {
+          mobile_perf:  ps.mobile?.categories?.performance  ?? null,
+          mobile_seo:   ps.mobile?.categories?.seo          ?? null,
+          mobile_acc:   ps.mobile?.categories?.accessibility ?? null,
+          mobile_bp:    ps.mobile?.categories?.best_practices ?? null,
+          desktop_perf: ps.desktop?.categories?.performance  ?? null,
+          desktop_seo:  ps.desktop?.categories?.seo          ?? null,
+          desktop_acc:  ps.desktop?.categories?.accessibility ?? null,
+          desktop_bp:   ps.desktop?.categories?.best_practices ?? null,
+        },
+
+        vitals_mobile:    {},
+        resources_mobile: {},
+
+        tech_stack: (stk.technologies ?? [])
+          .map(t => ({ name: t.name, category: t.category, confidence: Math.round((t.confidence ?? 0) * 100) }))
+          .sort((a, b) => b.confidence - a.confidence)
+          .slice(0, 8),
+
+        lead_temperature: null,
+      };
+
+      console.log("ℹ️  Stari format detektovan — konvertovan u call report strukturu");
+    } else {
+      throw new Error("Neispravan format fajla: nedostaje website_url ili item.lead.website_url");
     }
 
-    const { item } = data;
-    const url = item.lead?.website_url;
-    if (!url) throw new Error("Nedostaje lead.website_url");
-
+    const url = callReport.website_url;
     console.log(`🌐 ${url}`);
 
     // 2. Scrape sajta PRVO — rezultat ide i u AI analizu i u sumarizaciju
@@ -91,14 +176,10 @@ async function processFile(fileInfo, options) {
       console.log(`✅ Scrape: ${scrapeResult.extraPages?.length ?? 0} extra stranica`);
     }
 
-    // 3. AI analiza — koristi i scrapeBase za bogatiji kontekst
+    // 3. AI analiza — prima ceo call report + scrape
     const analysis = await withRetries(
       () => analyzeLeadWithDeepSeek({
-        lead:       item.lead,
-        mobile:     item.pagespeed?.mobile,
-        desktop:    item.pagespeed?.desktop,
-        signals:    item.signals   ?? {},
-        stack:      item.stack     ?? {},
+        callReport,
         scrapeBase: scrapeResult?.base ?? null,
       }),
       "AI analiza",
@@ -106,7 +187,7 @@ async function processFile(fileInfo, options) {
     );
     console.log(`✅ AI analiza: skor=${analysis.score}/100 | prioritet=${analysis.priority}`);
 
-    // 4. Sumiraj sadržaj sajta (tokens = LLM-ready string iz scrape-a)
+    // 4. Sumiraj sadržaj sajta
     const siteSummary = scrapeResult.ok
       ? await withRetries(
           () => summarizeSite({ url, tokens: scrapeResult.tokens }),
@@ -118,16 +199,23 @@ async function processFile(fileInfo, options) {
     console.log("✅ Sajt sumarizovan");
 
     // 5. Složi finalni lead pack
+    // lead objekat pravimo iz call reporta za kompatibilnost sa buildLeadPack/enrichLead
+    const lead = {
+      name:        callReport.name,
+      website_url: callReport.website_url,
+      address:     callReport.address,
+    };
+
     const leadPack = await withRetries(
-      () => buildLeadPack({ lead: item.lead, analysis, siteSummary }),
+      () => buildLeadPack({ lead, analysis, siteSummary }),
       "Build lead pack",
       CONFIG.MAX_RETRIES
     );
     console.log("✅ Lead pack kreiran");
 
-    // 6. Enrichment — mali fokusirani AI pozivi (cold email, ponuda, SWOT, report nota...)
+    // 6. Enrichment — mali fokusirani AI pozivi
     const enrichedPack = await withRetries(
-      () => enrichLead({ leadPack, analysis, item }),
+      () => enrichLead({ leadPack, analysis, item: callReport }),
       "Enrichment",
       CONFIG.MAX_RETRIES
     );
@@ -154,7 +242,7 @@ async function processFile(fileInfo, options) {
     fs.mkdirSync(CONFIG.FINAL_DIR, { recursive: true });
     const errorPath = path.join(CONFIG.FINAL_DIR, `${basename}.error.json`);
     writeJson(errorPath, {
-      lead:      data?.item?.lead ?? {},
+      lead:      { name: callReport?.name, website_url: callReport?.website_url },
       error:     { message: err?.message, stack: err?.stack },
       timestamp: new Date().toISOString(),
     });

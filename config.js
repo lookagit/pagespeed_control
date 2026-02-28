@@ -9,7 +9,7 @@ export const CONFIG = {
   DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY, // DeepSeek AI
 
   // === DIREKTORIJUMI ===
-  OUT_DIR: "./out",          // raw JSON fajlovi po leadu
+  OUT_DIR: "./out/pagespeedReports",          // raw JSON fajlovi po leadu
   FINAL_DIR: "./out/final",  // analizirani JSON fajlovi
   REPORT_DIR: "./out/report", // finalni CSV izveštaji
 

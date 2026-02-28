@@ -1,14 +1,17 @@
 // ============================================================
 // ai/analyzeLead.js - Srž sistema: AI analiza + skoring leada
 // ============================================================
-// Šalje sve prikupljene podatke DeepSeek-u i dobija:
-//   - skor 0-100 (koliko je lead "vruć")
-//   - prioritet: hot / warm / cold
-//   - konkretni problemi sajta
-//   - predlog šta da im ponudiš
+// Prima ceo call report (flat JSON iz pagespeed-reporter.js)
+// i opciono scrapeBase iz live scrape-a.
+//
+// Vraća:
+//   - score 0-100
+//   - priority: hot / warm / cold
+//   - problems, quick_wins, red_flags
+//   - pitch, summary, estimated_budget_range
 // ============================================================
 
-import OpenAI from "openai"; // DeepSeek koristi OpenAI-kompatibilni API
+import OpenAI from "openai";
 import { CONFIG } from "../config.js";
 
 const deepseek = new OpenAI({
@@ -17,56 +20,60 @@ const deepseek = new OpenAI({
 });
 
 // ─────────────────────────────────────────────────────────────
-// SCORE HELPER - lokalni pre-skor pre AI-a
+// PRE-SCORE — lokalni skor pre AI-a
+// Ulaz: callReport (flat call report objekat)
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Izračunava numerički skor na osnovu prikupljenih podataka.
- * Ovo je "signal" koji dajemo AI-u da bolje proceni.
- *
- * Visok skor = sajt ima PROBLEMA = odličan lead za web agenciju
- */
-function computePreScore({ mobile, desktop, signals, stack }) {
+function computePreScore({ callReport }) {
   let score = 0;
   const reasons = [];
 
-  const mPerf = mobile?.categories?.performance ?? 100;
-  const dPerf = desktop?.categories?.performance ?? 100;
+  const s = callReport.scores        || {};
+  const t = callReport.tracking      || {};
+  const v = callReport.vitals_mobile || {};
 
-  // Performance bodovi (max 40)
-  if (mPerf < 50)       { score += 20; reasons.push(`Mob performance: ${mPerf} (kritično sporo)`); }
-  else if (mPerf < 70)  { score += 10; reasons.push(`Mob performance: ${mPerf} (sporo)`); }
+  const mPerf = s.mobile_perf  ?? 100;
+  const dPerf = s.desktop_perf ?? 100;
 
-  if (dPerf < 60)       { score += 10; reasons.push(`Desktop perf: ${dPerf}`); }
-  else if (dPerf < 80)  { score +=  5; reasons.push(`Desktop perf: ${dPerf}`); }
+  // ── Performance ──────────────────────────────────────────
+  if (mPerf < 50)      { score += 20; reasons.push(`Mob perf: ${mPerf} (kritično sporo)`); }
+  else if (mPerf < 70) { score += 10; reasons.push(`Mob perf: ${mPerf} (sporo)`); }
 
-  // SEO bodovi (max 20)
-  const mSeo = mobile?.categories?.seo ?? 100;
-  if (mSeo < 70) { score += 15; reasons.push(`SEO: ${mSeo} (loš)`); }
-  else if (mSeo < 85) { score += 7; reasons.push(`SEO: ${mSeo} (prosečan)`); }
+  if (dPerf < 60)      { score += 10; reasons.push(`Desktop perf: ${dPerf}`); }
+  else if (dPerf < 80) { score +=  5; reasons.push(`Desktop perf: ${dPerf}`); }
 
-  // Dostupnost (max 10)
-  const mAcc = mobile?.categories?.accessibility ?? 100;
+  // ── SEO ──────────────────────────────────────────────────
+  const mSeo = s.mobile_seo ?? 100;
+  if (mSeo < 70)      { score += 15; reasons.push(`SEO: ${mSeo} (loš)`); }
+  else if (mSeo < 85) { score +=  7; reasons.push(`SEO: ${mSeo} (prosečan)`); }
+
+  // ── Accessibility ─────────────────────────────────────────
+  const mAcc = s.mobile_acc ?? 100;
   if (mAcc < 70) { score += 10; reasons.push(`Accessibility: ${mAcc}`); }
 
-  // Stack bodovi (max 20)
-  const cms = stack?.cms?.toLowerCase() ?? "";
-  if (cms.includes("wix"))          { score += 15; reasons.push("CMS: Wix (loš za SEO/speed)"); }
-  else if (cms.includes("squarespace")) { score += 10; reasons.push("CMS: Squarespace"); }
-  else if (cms.includes("weebly"))   { score += 15; reasons.push("CMS: Weebly (zastareo)"); }
-  else if (cms === "" || cms === "unknown") { score += 5; reasons.push("CMS: nepoznat"); }
+  // ── Tech stack ────────────────────────────────────────────
+  const topTech = (callReport.tech_stack?.[0]?.name ?? "").toLowerCase();
+  if      (topTech.includes("wix"))         { score += 15; reasons.push("Stack: Wix (loš za SEO/speed)"); }
+  else if (topTech.includes("squarespace")) { score += 10; reasons.push("Stack: Squarespace"); }
+  else if (topTech.includes("weebly"))      { score += 15; reasons.push("Stack: Weebly (zastareo)"); }
+  else if (!topTech)                        { score +=  5; reasons.push("Stack: nepoznat"); }
 
-  // Nema bookinga (max 10)
-  if (!signals?.booking?.type || signals?.booking?.confidence < 0.6) {
+  // ── Booking ───────────────────────────────────────────────
+  if (!callReport.has_online_booking && !callReport.booking_vendor) {
     score += 10;
     reasons.push("Nema online booking sistema");
   }
 
-  // Nema GA4/GTM (max 5)
-  if (!signals?.tracking?.ga4 && !signals?.tracking?.gtm) {
+  // ── Tracking ──────────────────────────────────────────────
+  if (!t.has_ga4 && !t.has_gtm) {
     score += 5;
     reasons.push("Nema GA4 ni GTM trackinga");
   }
+
+  // ── Core Web Vitals loši ──────────────────────────────────
+  const poorCount = Object.values(v).filter(x => x?.status === "poor").length;
+  if (poorCount >= 4)      { score += 10; reasons.push(`${poorCount} Core Web Vitals loših`); }
+  else if (poorCount >= 2) { score +=  5; reasons.push(`${poorCount} Core Web Vitals loših`); }
 
   return { preScore: Math.min(score, 100), reasons };
 }
@@ -75,49 +82,72 @@ function computePreScore({ mobile, desktop, signals, stack }) {
 // PROMPT BUILDER
 // ─────────────────────────────────────────────────────────────
 
-function buildPrompt({ lead, mobile, desktop, signals, stack, scrapeBase, preScore, prescore_reasons }) {
-  const m = mobile?.categories ?? {};
-  const d = desktop?.categories ?? {};
+function buildPrompt({ callReport, scrapeBase, preScore, prescore_reasons }) {
+  const s   = callReport.scores        || {};
+  const t   = callReport.tracking      || {};
+  const v   = callReport.vitals_mobile || {};
+  const seo = callReport.seo           || {};
 
-  // Izvuci korisne podatke iz scrape rezultata
-  const chatVendors    = scrapeBase?.vendors?.chatVendors?.join(", ")    || "nema";
-  const bookingVendors = scrapeBase?.vendors?.bookingVendors?.join(", ") || "nema";
-  const tracking       = scrapeBase?.vendors?.tracking?.join(", ")       || "nema";
-  const siteStack      = scrapeBase?.vendors?.stack?.join(", ")          || stack?.cms || "nepoznat";
-  const emails         = scrapeBase?.contacts?.emailsInText?.slice(0,3)?.join(", ") || "nema";
-  const phones         = scrapeBase?.contacts?.tel?.slice(0,3)?.join(", ")          || "nema";
-  const hasBooking     = (scrapeBase?.vendors?.bookingVendors?.length ?? 0) > 0;
-  const formCount      = scrapeBase?.forms?.count ?? 0;
-  const h1             = scrapeBase?.headings?.h1?.slice(0,2)?.join(" | ") || "nema";
-  const title          = scrapeBase?.title || "nema";
+  // Vitals — samo loši
+  const poorVitals = Object.entries(v)
+    .filter(([, val]) => val?.status === "poor")
+    .map(([k, val]) => `${k.toUpperCase()} ${val.value}`)
+    .join(", ") || "nema";
+
+  // Tech stack
+  const siteStack = callReport.tech_stack?.map(t => t.name).join(", ") || "nepoznat";
+
+  // Scrape podaci — fallback na call report vrednosti
+  const chatVendors    = scrapeBase?.vendors?.chatVendors?.join(", ")             || "nema";
+  const bookingVendors = scrapeBase?.vendors?.bookingVendors?.join(", ")          || "nema";
+  const scrapeEmails   = scrapeBase?.contacts?.emailsInText?.slice(0, 3)?.join(", ") || "nema";
+  const scrapePhones   = scrapeBase?.contacts?.tel?.slice(0, 3)?.join(", ")          || "nema";
+  const h1             = scrapeBase?.headings?.h1?.slice(0, 2)?.join(" | ")       || seo.h1_text || "nema";
+  const scrapeTitle    = scrapeBase?.title || "nema";
+
+  // Kontakt — preferuj call report, fallback na scrape
+  const emails = callReport.emails?.length
+    ? callReport.emails.join(", ")
+    : scrapeEmails;
+
+  const phones = callReport.phones?.length
+    ? callReport.phones.join(", ")
+    : scrapePhones;
 
   return `Ti si ekspert analitičar za digitalni marketing koji radi za web agenciju.
 Tvoj zadatak je da analiziraš podatke o jednom biznis leadu i odgovoriš ISKLJUČIVO JSON-om.
 
 ## Podaci o leadu
-- Biznis: ${lead.company || lead.name}
-- Lokacija: ${lead.city || ""} ${lead.state || ""}
-- Google rating: ${lead.rating ?? "N/A"} (${lead.user_ratings_total ?? 0} recenzija)
-- Website: ${lead.website_url}
+- Biznis: ${callReport.name ?? "N/A"}
+- Website: ${callReport.website_url ?? "N/A"}
+- Adresa: ${callReport.address ?? "N/A"}
+- Health score: ${callReport.health_score ?? "N/A"}/100 (${callReport.health_grade ?? "?"})
+- Lead temperatura: ${callReport.lead_temperature?.label ?? "N/A"} (score: ${callReport.lead_temperature?.score ?? "?"}/${callReport.lead_temperature?.max_score ?? "?"})
 
 ## PageSpeed Insights
-Mobile:  Performance=${m.performance ?? "N/A"} | SEO=${m.seo ?? "N/A"} | Accessibility=${m.accessibility ?? "N/A"}
-Desktop: Performance=${d.performance ?? "N/A"} | SEO=${d.seo ?? "N/A"}
+Mobile:  Performance=${s.mobile_perf ?? "N/A"} | SEO=${s.mobile_seo ?? "N/A"} | Accessibility=${s.mobile_acc ?? "N/A"} | BP=${s.mobile_bp ?? "N/A"}
+Desktop: Performance=${s.desktop_perf ?? "N/A"} | SEO=${s.desktop_seo ?? "N/A"} | Accessibility=${s.desktop_acc ?? "N/A"} | BP=${s.desktop_bp ?? "N/A"}
 
-## Signali sa sajta (live scrape)
-- Naslov sajta: ${title}
+## Core Web Vitals (mobile) — loši signali
+${poorVitals}
+
+## Signali sa sajta
+- Naslov (scrape): ${scrapeTitle}
 - H1: ${h1}
-- CMS/Stack: ${siteStack}
-- Online booking sistem: ${hasBooking ? bookingVendors : "nema"}
-- Live chat: ${chatVendors}
-- Tracking alati: ${tracking}
-- Broj formi: ${formCount}
-- Email (sa sajta): ${emails}
-- Telefon (sa sajta): ${phones}
-- Meta Pixel: ${signals?.tracking?.meta_pixel ? "DA" : "NE"}
+- Tech stack: ${siteStack}
+- Online booking: ${callReport.has_online_booking ? (callReport.booking_vendor ?? callReport.booking_type) : "nema"}
+- GA4: ${t.has_ga4 ? "DA" : "NE"} | GTM: ${t.has_gtm ? "DA" : "NE"} | Meta Pixel: ${t.has_meta_pixel ? "DA" : "NE"} | Google Ads: ${t.has_google_ads ? "DA" : "NE"}
+- Chatbot: ${t.has_chatbot ? (t.chatbot_vendor ?? "DA, vendor nepoznat") : "NE"}
+- Email na sajtu: ${emails}
+- Telefon na sajtu: ${phones}
+- SEO: title=${seo.has_title ? "DA" : "NE"} | meta desc=${seo.has_meta_description ? "DA" : "NE"} | schema=${seo.has_structured_data ? (seo.structured_data_type ?? "DA") : "NE"} | H1 count=${seo.h1_count ?? "?"}
+- Live scrape — chat: ${chatVendors} | booking vendori: ${bookingVendors}
+
+## Lead temperature signali
+${callReport.lead_temperature?.signals?.map((s, i) => `  ${i + 1}. ${s}`).join("\n") ?? "N/A"}
 
 ## Pre-skor sistema
-Algoritmički skor (0-100, veći = više problema): ${preScore}
+Algoritmički skor (0-100, veći = više problema = bolji lead): ${preScore}
 Razlozi: ${prescore_reasons.join("; ")}
 
 ## INSTRUKCIJE
@@ -126,12 +156,12 @@ Na osnovu SVIH podataka proceni:
 2. Koliko su "vrući" kao lead za web agenciju?
 3. Šta konkretno im nedostaje?
 
-Odgovori ISKLJUČIVO validnim JSON objektom ovog oblika (bez objašnjenja, bez markdowna):
+Odgovori ISKLJUČIVO validnim JSON objektom (bez objašnjenja, bez markdowna):
 {
-  "score": <broj 0-100, gde 100 = savršen lead, puno problema>,
+  "score": <broj 0-100, gde 100 = savršen lead sa puno problema>,
   "priority": <"hot" | "warm" | "cold">,
   "problems": [
-    "<konkretan problem 1>",
+    "<konkretan problem 1 sa brojevima ako je moguće>",
     "<konkretan problem 2>"
   ],
   "pitch": "<2-3 rečenice: šta bi agencija predložila ovom klijentu>",
@@ -142,7 +172,7 @@ Odgovori ISKLJUČIVO validnim JSON objektom ovog oblika (bez objašnjenja, bez m
   "red_flags": [
     "<razlog zašto možda NISU dobar lead, ako postoji>"
   ],
-  "estimated_budget_range": "<npr: $1k-3k | $3k-8k | $8k+>",
+  "estimated_budget_range": "<$1k-3k | $3k-8k | $8k+>",
   "summary": "<jedna rečenica sažetak>"
 }`;
 }
@@ -151,32 +181,31 @@ Odgovori ISKLJUČIVO validnim JSON objektom ovog oblika (bez objašnjenja, bez m
 // GLAVNI EXPORT
 // ─────────────────────────────────────────────────────────────
 
-export async function analyzeLeadWithDeepSeek({ lead, mobile, desktop, signals, stack, scrapeBase = null }) {
-  const { preScore, reasons } = computePreScore({ mobile, desktop, signals, stack });
+export async function analyzeLeadWithDeepSeek({ callReport, scrapeBase = null }) {
+  const { preScore, reasons } = computePreScore({ callReport });
 
   const prompt = buildPrompt({
-    lead, mobile, desktop, signals, stack, scrapeBase,
+    callReport,
+    scrapeBase,
     preScore,
     prescore_reasons: reasons,
   });
 
   const response = await deepseek.chat.completions.create({
-    model: "deepseek-chat",
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0.3, // niska temperatura = konzistentni, predvidivi izlazi
-    max_tokens: 800,
+    model:       "deepseek-chat",
+    messages:    [{ role: "user", content: prompt }],
+    temperature: 0.3,
+    max_tokens:  800,
   });
 
   const raw = response.choices[0]?.message?.content?.trim() ?? "";
 
-  // Parsiraj JSON odgovor
   const jsonMatch = raw.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error(`DeepSeek nije vratio validan JSON:\n${raw}`);
 
   const analysis = JSON.parse(jsonMatch[0]);
 
-  // Dodaj pre-skor podatke radi transparentnosti
-  analysis.pre_score     = preScore;
+  analysis.pre_score         = preScore;
   analysis.pre_score_reasons = reasons;
 
   return analysis;
