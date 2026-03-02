@@ -1,135 +1,111 @@
+// ============================================================
+// ai/createFinalReport.js — Zoho Leads CSV export
+// ============================================================
+// STANDARD ZOHO FIELDS (already exist in Zoho — do not create):
+//   First Name, Last Name, Company, Phone, Email, Website,
+//   Street, City, State, Zip Code, Country,
+//   Lead Source, Lead Status, Industry, Description
+//
+// CUSTOM FIELDS to create in Zoho (Settings → Modules → Leads):
+//   Multi Line (6): Cold Email Text, Call Script, Website Issues,
+//                   Agent Briefing, Pitch, Lead Recap
+//   (Cold Email Text includes subject line on first line)
+// ============================================================
+
 import fs from "fs";
-import { OpenAI } from "openai"; // OpenAI SDK (DeepSeek compatible)
-import { writeFileSafe } from "../utils/writeFileSafe.js";
-import "dotenv/config";
-import { ENGINES } from "./strict.js";
+import path from "path";
 
-// DeepSeek client (OpenAI‑compatible)
-const deepseek = new OpenAI({
-  apiKey: process.env.DEEP_SEEK_API_KEY,
-  baseURL: "https://api.deepseek.com/v1",
-});
+const ZOHO_COLUMNS = [
+  // ── STANDARD ZOHO LEADS (do not rename) ───────────────────
+  "First Name",
+  "Last Name",
+  "Company",
+  "Phone",
+  "Email",
+  "Website",
+  "Street",
+  "City",
+  "State",
+  "Zip Code",
+  "Country",
+  "Lead Source",       // → "Google Places"
+  "Lead Status",       // → "New"
+  "Industry",          // → "Healthcare"
+  "Description",       // → Agent Briefing (visible on lead open)
 
-// CSV escaping (ClickUp import expects quoted fields with double quotes escaped)
-function csvEscape(value) {
-  const s = String(value ?? "");
-  const escaped = s.replace(/"/g, '""');
-  return `"${escaped}"`;
+  // ── CUSTOM: 6 MULTI LINE (ordered by priority) ───────────────
+  "Cold Email Text",   // #1 — SUBJECT: ... \n --- \n 5-sentence email
+  "Call Script",       // #2 — 30-second opener
+  "Website Issues",    // #3 — Factual site problems with numbers
+  "Agent Briefing",    // #4 — WHO / PROBLEM / WE OFFER / BUDGET / CALL GOAL
+  "Pitch",             // #5 — Why call them + expected outcome
+  "Lead Recap",        // #6 — Score, Priority, Budget, Google, Site info
+];
+
+function mapToZoho(pack) {
+  const l = pack.lead     ?? {};
+  const a = pack.analysis ?? {};
+  const s = pack.site     ?? {};
+  const e = pack.enriched ?? {};
+
+  return {
+    // Standard Zoho
+    "First Name":  l["First Name"] || "",
+    "Last Name":   l["Last Name"]  || l.name || "Lead",
+    "Company":     l.Company       || l.name || "",
+    "Phone":       l.Phone         || l.phone || "",
+    "Email":       l.email         || "",
+    "Website":     l.Website       || l.website_url || "",
+    "Street":      l.Street        || "",
+    "City":        l.City          || "",
+    "State":       l.State         || "",
+    "Zip Code":    l["Zip Code"]   || "",
+    "Country":     l.Country       || "USA",
+    "Lead Source": "Google Places",
+    "Lead Status": "New",
+    "Industry":    "Healthcare",
+    "Description": e.agent_briefing || "",  // agent sees this first when opening lead
+
+    // Custom: Multi Line (ordered by priority)
+    "Cold Email Text":  e.cold_email     || "",
+    "Call Script":      e.call_script    || "",
+    "Website Issues":   e.website_issues || "",
+    "Agent Briefing":   e.agent_briefing || "",
+    "Pitch":            e.pitch          || "",
+    "Lead Recap":       e.lead_recap     || "",
+  };
 }
 
-// Updated system prompt – email templates removed
-const SYSTEM_PROMPT = `TI SI “ClickUp Lead Pack Builder” za B2B prodaju (dental klinike u Nemačkoj).
-Ulaz je jedan JSON lead pack (podaci + emaili + tehničke tačke + upsell + followup + site_report).
-
-CILJ: vrati JEDAN JSON objekat koji se uklapa u šemu:
-- task_name: samo ime lida (kratko, sa gradom ako postoji).
-- status: uvek "New Lead"
-- priority: uvek "High"
-- tags: string sa tagovima odvojenim sa ";" (obavezno: berlin;dentist; + 3–6 relevantnih tagova iz podataka, npr. no-email, ga4, gtm, chatbot, performance, no-social, no-booking, callcenter)
-- description: “operater miran” playbook, maksimalno koristan i kompletan.
-
-PRAVILA:
-- SVE OSIM task_name ide u description.
-- Nemoj da izmišljaš email/telefon. Ako nema email: jasno napiši “Email: NEMA (uzeti tokom poziva)”.
-- Ne koristi linkove ka nepoznatim stvarima; koristi samo ono što postoji u JSON-u (telefon, sajt, adresa, vendor npr. Doctolib/Cookiebot itd).
-- Izvuci najkorisnije signale iz site_report (npr. nema booking/chat/social/GA4).
-- Tehničke stvari napiši kratko i u brojkama gde postoje (JS KiB, CSS KiB, mobile/desktop score, load time).
-- Sve što je na ENG (npr. upsell “why_now/trigger/proof/next_step”) prevedi na SR u description-u.
-- DELIMIČNO: Call Script, kvalifikaciona pitanja i objection handling moraju biti na NEMAČKOM (DE). Ostalo je na SR.
-
-FORMAT description-a (tačno ovim redosledom, jasni naslovi):
-1) LEAD KARTICA (Naziv, Adresa, Telefon, Web, Email, Izvor)
-2) CILJ POZIVA (10 MIN) (3–5 kratkih rečenica)
-3) 2–5 KLJUČNIH PROBLEMA (iz podataka + site_report)
-4) SKRIPT ZA POZIV (DE) — copy/paste
-5) 5 KVALIFIKACIONIH PITANJA (DE)
-6) KAKO ODGOVORITI NA PRIGOVORE (DE) (4–6 tipičnih)
-7) SLEDEĆI KORACI (SR)
-8) SEKVENCA NAKNADNOG PRAĆENJA (SR) (iz followup_sequence)
-9) KONTROLNA LISTA (SR) (checkbox linije)
-10) DODATNE USLUGE (UPSELL) (SR) – sa “Zašto sada / Okidač / Dokaz / Sledeći korak”
-
-TVOJ ODGOVOR MORA BITI ISKLJUČIVO VALIDAN JSON OBJEKAT, BEZ DODATNOG TEKSTA ILI OZNAKA.`;
-
-// JSON schema for the output (used for validation, optional)
-const OUTPUT_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    task_name: { type: "string" },
-    status: { type: "string", enum: ["New Lead"] },
-    priority: { type: "string", enum: ["High"] },
-    tags: { type: "string", description: "Semicolon-separated tags" },
-    description: { type: "string" },
-  },
-  required: ["task_name", "status", "priority", "tags", "description"],
-};
-
-/**
- * Simple JSON validation against a JSON schema (optional).
- * You can install `ajv` for full validation, but here we only check required fields.
- */
-function validateOutput(obj) {
-  const required = OUTPUT_SCHEMA.required;
-  for (const field of required) {
-    if (!(field in obj)) {
-      throw new Error(`Missing required field: ${field}`);
-    }
-  }
-  if (obj.status !== "New Lead") obj.status = "New Lead"; // enforce
-  if (obj.priority !== "High") obj.priority = "High";
-  return obj;
+function capitalize(str) {
+  if (!str) return "";
+  return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
-export async function leadPackToClickUpCsv(leadPackJson, outPath = "./out/clickup/clickup_import.csv") {
-  const response = await deepseek.chat.completions.create({
-    model: ENGINES.REASONING, // or use ENGINES.SMART from your config
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: JSON.stringify(leadPackJson) },
-    ],
-    max_tokens: 6000,
-    temperature: 0, // deterministic
-    response_format: { type: "json_object" },
-  });
-
-  const content = response.choices[0]?.message?.content;
-  if (!content) {
-    throw new Error("Empty response from DeepSeek API");
+function escapeCsv(value) {
+  if (value === null || value === undefined) return "";
+  const str = String(value);
+  if (str.includes(",") || str.includes('"') || str.includes("\n") || str.includes("\r")) {
+    return `"${str.replace(/"/g, '""')}"`; 
   }
+  return str;
+}
 
-  // Parse JSON (DeepSeek JSON mode should return valid JSON)
-  let parsed;
-  try {
-    parsed = JSON.parse(content);
-  } catch (e) {
-    // Fallback: attempt to extract JSON from the response
-    const firstBrace = content.indexOf('{');
-    const lastBrace = content.lastIndexOf('}');
-    if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
-      throw new Error(`Could not extract JSON from response: ${content.substring(0, 200)}...`);
-    }
-    const extracted = content.substring(firstBrace, lastBrace + 1);
-    parsed = JSON.parse(extracted);
-  }
+function packToRow(pack) {
+  const mapped = mapToZoho(pack);
+  return ZOHO_COLUMNS.map(col => escapeCsv(mapped[col])).join(",");
+}
 
-  // Optional validation
-  const out = validateOutput(parsed);
+export async function leadPackToCsv(pack, outputPath) {
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  const header = ZOHO_COLUMNS.join(",");
+  const row    = packToRow(pack);
+  fs.writeFileSync(outputPath, [header, row].join("\n"), "utf8");
+}
 
-  // Build CSV
-  const header = "Task Name,Description,Status,Priority,Tags\n";
-  const row = [
-    csvEscape(out.task_name),
-    csvEscape(out.description),
-    csvEscape(out.status),
-    csvEscape(out.priority),
-    csvEscape(out.tags),
-  ].join(",") + "\n";
-
-  console.log("Generated ClickUp Task:", header);
-  console.log("Generated ClickUp Task:", row);
-
-  await writeFileSafe(outPath, header + row);
-
-  return { outPath, ...out };
+export async function mergeLeadPacksToCsv(packs, outputPath) {
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  const header = ZOHO_COLUMNS.join(",");
+  const rows   = packs.map(packToRow);
+  fs.writeFileSync(outputPath, [header, ...rows].join("\n"), "utf8");
+  console.log(`📊 Zoho CSV (${packs.length} leads): ${outputPath}`);
 }

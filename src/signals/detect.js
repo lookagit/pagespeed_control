@@ -49,37 +49,71 @@ function detectTracking(scriptBlob) {
 // ============================================================
 
 function detectChatbot(scriptBlob, htmlLower) {
-  const chatbotVendors = [
-    ["chatbase", /chatbase\.co|window\.chatbase|chatbase/i],
-    ["intercom", /widget\.intercom\.io|window\.intercom/i],
-    ["crisp", /client\.crisp\.chat/i],
-    ["tawk.to", /tawk\.to/i],
-    ["zendesk", /static\.zdassets\.com|zE\(/i],
-    ["drift", /js\.driftt\.com/i],
-    ["hubspot", /js\.hs-scripts\.com|hubspotconversations/i],
-    ["smartsupp", /smartsupp/i],
-    ["tidio", /tidio\.co|tidiochat/i],
-    ["livechat", /livechatinc/i],
-    ["freshchat", /freshchat/i],
-    ["chatwoot", /chatwoot/i],
-    ["olark", /olark\.com/i],
-    ["userlike", /userlike/i],
+  const blob = String(scriptBlob || "");
+  const html = String(htmlLower || "");
+
+  // helper: stronger confidence if it looks like a real embed (script/src/widget snippet)
+  const strongHit = (rx) =>
+    rx.test(blob) || rx.test(html) ||
+    /<script|widget|iframe|chat|messenger|launcher/i.test(blob);
+
+  const vendors = [
+    // --- Big / common US live chat ---
+    ["intercom", /widget\.intercom\.io|window\.intercom|intercomSettings/i],
+    ["zendesk", /static\.zdassets\.com|zendesk\.com\/embeddable|zE\(|webWidget/i],
+    ["drift", /js\.driftt\.com|drift\.load|drift\.on\(/i],
+    ["hubspot", /js\.hs-scripts\.com|hubspotconversations|hsConversations/i],
+    ["livechat", /livechatinc\.com|livechat\.js|__lc\.license/i],
+    ["tawk.to", /tawk\.to|tawk_LoadStart/i],
+    ["crisp", /client\.crisp\.chat|window\.\$crisp/i],
+    ["tidio", /tidio\.co|tidioChat|tidiochat/i],
+    ["smartsupp", /smartsupp|_smartsupp/i],
+    ["olark", /olark\.com|olark\(/i],
+    ["userlike", /userlike|userlike-cdn/i],
+    ["freshchat", /freshchat|freshworks\.com\/live-chat/i],
+
+    // --- US dental / healthcare focused (very common) ---
+    ["podium", /podium\.com|podium\.io|podium-webchat|podiumchat/i],
+    ["birdeye", /birdeye\.com|birdeye\.io|birdeye-widget|birdeyeChat/i],
+    ["nexhealth", /nexhealth\.com|nexhealth.*widget|nexhealth-chat/i],
+    ["demandforce", /demandforce\.com|demandforce.*widget|dfChat/i],
+    ["solutionreach", /solutionreach\.com|solutionreach.*widget|srChat/i],
+    ["weave", /getweave\.com|weave.*widget|weave-chat/i],
+    ["yapi", /yapiapp\.com|yapi\.me|yapi.*widget|yapi-chat/i],
+    ["patientpop", /patientpop\.com|patientpop.*widget|patientpop-chat/i],
+    ["carecru", /carecru\.com|carecru.*widget|carecru-chat/i],
+    ["revive", /revivesoftware\.com|revive.*chat|revive-chat/i],
+
+    // --- Call / chat / scheduling combos that appear as widgets ---
+    ["callrail", /callrail\.com|callrail.*widget/i],
+    ["ringcentral", /ringcentral\.com|ringcentral.*widget/i],
+    ["twilio", /twilio\.com|twilio.*chat|twilio.*conversations/i],
+
+    // --- Other popular website chat widgets ---
+    ["gorgias", /gorgias\.com|gorgias-chat|gorgias.*widget/i],
+    ["zoho salesiq", /salesiq\.zoho\.com|zsiq|ZohoSalesIQ/i],
+    ["helpscout beacon", /beacon-v2\.helpscout\.net|HS\.Beacon/i],
+    ["kommunicate", /kommunicate\.io|kommunicate|kmChat/i],
+    ["chatra", /chatra\.io|chatra\.js/i],
+    ["jivochat", /jivochat\.com|jivo_api/i],
+    ["liveperson", /liveperson\.net|lpTag/i],
   ];
 
-  for (const [name, rx] of chatbotVendors) {
-    if (rx.test(scriptBlob) || rx.test(htmlLower)) {
-      return { 
-        has_chatbot: true, 
-        vendor: name, 
-        confidence: 0.95 
+  for (const [name, rx] of vendors) {
+    if (rx.test(blob) || rx.test(html)) {
+      const conf = strongHit(rx) ? 0.95 : 0.75;
+      return {
+        has_chatbot: true,
+        vendor: name,
+        confidence: conf,
       };
     }
   }
 
-  return { 
-    has_chatbot: false, 
-    vendor: null, 
-    confidence: 0.0 
+  return {
+    has_chatbot: false,
+    vendor: null,
+    confidence: 0.0,
   };
 }
 
@@ -88,59 +122,161 @@ function detectChatbot(scriptBlob, htmlLower) {
 // ============================================================
 
 function detectBooking(scriptBlob, htmlLower, bodyText, $) {
-  // Known booking vendors
+  const blob = String(scriptBlob || "");
+  const html = String(htmlLower || "");
+  const text = String(bodyText || "").toLowerCase();
+
+  // Helper: if it looks like a real embedded widget
+  const isEmbedLike = (rx) =>
+    rx.test(blob) || rx.test(html) ||
+    /<iframe|<script|widget|scheduler|schedule|appointment/i.test(blob);
+
+  // USA dental / healthcare scheduling + common schedulers
   const bookingVendors = [
+    // Dental-focused (very common in US)
+    ["nexhealth", /nexhealth\.com|nexhealth.*(widget|book|schedule)|nexhealth/i],
+    ["localmed", /localmed\.com|localmed.*(widget|schedule|appointment)|localmed/i],
+    ["solutionreach", /solutionreach\.com|solutionreach.*(schedule|appointment|widget)|srchat|sr.*appointment/i],
+    ["demandforce", /demandforce\.com|demandforce.*(schedule|appointment|widget)|demandforce/i],
+    ["yapi", /yapiapp\.com|yapi\.me|yapi.*(forms|schedule|appointment|widget)|yapi/i],
+    ["weave", /getweave\.com|weave.*(schedule|appointment|widget)|weave/i],
+    ["carecru", /carecru\.com|carecru.*(schedule|appointment|widget)|carecru/i],
+    ["patientpop", /patientpop\.com|patientpop.*(schedule|appointment|widget)|patientpop/i],
+    ["modento", /modento\.io|modento.*(schedule|appointment|widget)|modento/i],
+    ["opera dds", /operadds\.com|opera.*(schedule|appointment|widget)|operadds/i],
+    ["curve dental", /curvedental\.com|curve.*(schedule|appointment|widget)|curvedental/i],
+    ["dental intelligence", /dentalintel\.com|dentalintelligence|localmed/i],
+
+    // General medical marketplace / booking
+    ["zocdoc", /zocdoc\.com|zocdoc/i],
+
+    // General schedulers (still appear on US sites)
     ["calendly", /calendly\.com|calendly\.initpopupwidget/i],
+    ["acuity", /acuityscheduling\.com|acuity/i],
+    ["setmore", /setmore\.com|setmore/i],
     ["simplybook", /simplybook/i],
-    ["setmore", /setmore\.com/i],
-    ["acuity", /acuityscheduling\.com/i],
-    ["booksy", /booksy\.com/i],
-    ["doctolib", /doctolib/i],
-    ["practo", /practo\.com/i],
-    ["zocdoc", /zocdoc\.com/i],
   ];
 
-  // Check for vendor widgets
   for (const [name, rx] of bookingVendors) {
-    if (rx.test(scriptBlob) || rx.test(htmlLower)) {
-      return { 
-        type: name, 
-        evidence: "embed/script", 
-        confidence: 0.9 
+    if (rx.test(blob) || rx.test(html)) {
+      return {
+        type: name,
+        evidence: "embed/script",
+        confidence: isEmbedLike(rx) ? 0.95 : 0.85,
       };
     }
   }
 
-  // Fallback: keyword + form detection
+  // --- Fallback signals (US dental phrasing) ---
   const bookingKeywords = [
-    "termin", "zakaz", "appointment", "book", 
-    "online-termin", "reserv", "schedule", "buchen"
+    // core
+    "request appointment",
+    "schedule appointment",
+    "schedule online",
+    "book appointment",
+    "book online",
+    "book now",
+    "make an appointment",
+    "appointment request",
+    "online scheduling",
+    "schedule a visit",
+    "reserve appointment",
+
+    // dental-specific common CTAs
+    "new patient",
+    "new patient forms",
+    "patient forms",
+    "forms",
+    "check-in",
+    "paperwork",
+    "insurance verification",
+
+    // urgent/after-hours
+    "emergency appointment",
+    "same-day appointment",
+    "same day appointment",
+    "walk-in",
+    "walk ins",
+    "urgent dental",
+    "after hours",
+
+    // consult
+    "free consultation",
+    "consultation request",
+    "virtual consultation",
+    "telehealth",
+    "teledentistry",
   ];
-  
-  const hasBookingText = bookingKeywords.some(k => bodyText.includes(k));
-  const hasForm = $("form").length > 0;
-  const phones = $("a[href^='tel:']").length;
 
-  if (hasBookingText && hasForm) {
-    return { 
-      type: "form", 
-      evidence: "form + booking keywords", 
-      confidence: 0.7 
+  const hasBookingText = bookingKeywords.some((k) => text.includes(k));
+
+  // form/portal-ish detection
+  const formsCount = ($ && $("form").length) || 0;
+
+  // common appointment-ish links/buttons
+  const apptLinkCount = ($ && $("a,button").filter((i, el) => {
+    const t = ($(el).text() || "").toLowerCase();
+    const href = (($(el).attr && $(el).attr("href")) || "").toLowerCase();
+    return (
+      t.includes("appointment") ||
+      t.includes("schedule") ||
+      t.includes("request") ||
+      t.includes("book") ||
+      href.includes("appointment") ||
+      href.includes("schedule") ||
+      href.includes("book") ||
+      href.includes("request")
+    );
+  }).length) || 0;
+
+  const hasIframe = ($ && $("iframe").length > 0) || /<iframe/i.test(html);
+  const phones = ($ && $("a[href^='tel:']").length) || 0;
+  const mails = ($ && $("a[href^='mailto:']").length) || 0;
+
+  // Strong-ish: booking text + (form or appt CTA or iframe)
+  if (hasBookingText && (formsCount > 0 || apptLinkCount > 0 || hasIframe)) {
+    return {
+      type: formsCount > 0 ? "form" : "cta",
+      evidence: formsCount > 0
+        ? "booking keywords + form"
+        : hasIframe
+          ? "booking keywords + iframe"
+          : "booking keywords + appointment CTA",
+      confidence: formsCount > 0 ? 0.78 : 0.72,
     };
   }
-  
+
+  // Medium: appointment CTA without keywords (some pages are minimal)
+  if (apptLinkCount > 0 || hasIframe) {
+    return {
+      type: hasIframe ? "embed" : "cta",
+      evidence: hasIframe ? "iframe present" : "appointment CTA present",
+      confidence: 0.55,
+    };
+  }
+
+  // Weak: phone present (common “Call to schedule”)
   if (phones > 0) {
-    return { 
-      type: "phone", 
-      evidence: "tel: link present", 
-      confidence: 0.6 
+    return {
+      type: "phone",
+      evidence: "tel: link present",
+      confidence: 0.6,
     };
   }
 
-  return { 
-    type: null, 
-    evidence: null, 
-    confidence: 0.0 
+  // Weak: mail present
+  if (mails > 0) {
+    return {
+      type: "email",
+      evidence: "mailto: link present",
+      confidence: 0.45,
+    };
+  }
+
+  return {
+    type: null,
+    evidence: null,
+    confidence: 0.0,
   };
 }
 

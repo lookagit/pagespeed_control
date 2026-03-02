@@ -130,3 +130,26 @@ export const Site10Schema = z.object({
   }),
 });
 
+// ============================================================
+// schemas.js - Validacione šeme za ulazne podatke
+// ============================================================
+import { z } from "zod";
+
+// Minimalna šema - website_url je obavezan, ostalo best-effort
+export const LeadSchema = z.object({
+  name: z.string().min(1),
+  phone: z.string().optional().default(""),
+  website_url: z.string().url(),
+  address: z.string().optional().default(""),
+  // Google Places polja (opciona)
+  place_id: z.string().optional().default(""),
+  rating: z.coerce.number().optional().nullable(),
+  user_ratings_total: z.coerce.number().optional().nullable(),
+  maps_url: z.string().optional().default(""),
+  business_status: z.string().optional().default(""),
+});
+
+export const LeadSchemaStrict = LeadSchema.extend({
+  phone: z.string().min(1),
+  address: z.string().min(1),
+});

@@ -1,232 +1,182 @@
 // ============================================================
-// STAGE 1: DATA COLLECTION PIPELINE
+// index.js - STAGE 1: Prikupljanje podataka o leadovima
 // ============================================================
-// Purpose: Collect raw data from leads and save to individual JSON files
-// Output: out/{sanitized-url}-{hash}.json per lead
+// Ulaz : CSV sa leadovima (LEADS_CSV u config.js)
+// Izlaz: out/{url-hash}.json za svaki lead
 //
-// Usage: node src/index.js
+// Pokretanje:
+//   node src/index.js           - preskače već obrađene
+//   node src/index.js --force   - obrađuje sve iznova
 // ============================================================
 
+import fs from "fs";
 import { CONFIG } from "./config.js";
 import { LeadSchema } from "./schemas.js";
 import { readCsv } from "./io/csv.js";
 import { ensureDir, writeJson } from "./io/write.js";
-import { sleep } from "./utils/sleep.js";
+import { sleep, withRetries } from "./utils/helpers.js";
 import { runPageSpeed } from "./pagespeed/psi.js";
-import { collectSignals } from "./signals/crawl.js";
+import { collectSignals, collectContactDetails } from "./signals/crawl.js";
 import { getCrux } from "./crux/crux.js";
 import { fetchHtmlWithHeaders, detectStack } from "./stack/index.js";
 import { sanitizeFileName } from "./utils/sanitizeFileName.js";
-import fs from "fs";
-// ============================================================
-// CONFIGURATION
-// ============================================================
 
-const PIPELINE_CONFIG = {
-  STAGE_NAME: "DATA_COLLECTION",
-  OUTPUT_DIR: CONFIG.OUT_DIR || "./out",
-  BATCH_SIZE: 1, // Process one at a time for stability
-  RETRY_ATTEMPTS: 2,
-  RETRY_DELAY_MS: 5000,
-};
+// ─────────────────────────────────────────────────────────────
+// NORMALIZACIJA ULAZNIH PODATAKA
+// ─────────────────────────────────────────────────────────────
 
-// ============================================================
-// TYPES & CONSTANTS
-// ============================================================
+function looksLikeBusiness(name = "") {
+  const businessWords = [
+    "dental", "dentistry", "clinic", "office", "center", "family",
+    "llc", "inc", "ltd", "co.", "pllc", "pc", "practice", "studio",
+    "group", "associates", "partners",
+  ];
+  return businessWords.some(w => name.toLowerCase().includes(w));
+}
 
-const ProcessingStage = {
-  PAGESPEED: "pagespeed",
-  SIGNALS: "signals",
-  CRUX: "crux",
-  STACK: "stack",
-};
+function splitName(name = "") {
+  const clean = String(name).trim();
+  if (!clean) return { first: "", last: "", company: "" };
 
-const ResultStatus = {
-  SUCCESS: "success",
-  PARTIAL: "partial",
-  FAILED: "failed",
-};
+  if (looksLikeBusiness(clean)) {
+    return { first: "", last: clean, company: clean };
+  }
 
-// ============================================================
-// VALIDATION
-// ============================================================
+  const parts = clean.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    const last = parts.pop();
+    return { first: parts.join(" "), last, company: "" };
+  }
+
+  return { first: "", last: clean, company: clean };
+}
+
+function parseAddress(address = "") {
+  const out = { street: "", city: "", state: "", postal_code: "", country: "", full: "" };
+  if (!address) return out;
+
+  out.full = address.trim();
+  const parts = out.full.split(",").map(s => s.trim()).filter(Boolean);
+
+  out.street  = parts[0] || "";
+  out.city    = parts[1] || "";
+  out.country = parts[3] || "";
+
+  const stateZip = parts[2] || "";
+  const m = stateZip.match(/\b([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\b/);
+  out.state       = m ? m[1] : "";
+  out.postal_code = m ? m[2] : "";
+
+  return out;
+}
+
+function normalizeLead(row) {
+  const name    = row.name ?? row.Name ?? row.company ?? "";
+  const phone   = row.phone ?? row.Phone ?? "";
+  const url     = row.website_url ?? row.website ?? row.Website ?? "";
+  const address = row.address ?? row.Address ?? "";
+
+  const { first, last, company } = splitName(name);
+  const addr = parseAddress(address);
+
+  return {
+    name, phone,
+    website_url: url,
+    address,
+    first_name:  first,
+    last_name:   last || name,
+    company:     company || name,
+    street:      addr.street,
+    city:        addr.city,
+    state:       addr.state,
+    postal_code: addr.postal_code,
+    country:     addr.country,
+    full_address: addr.full,
+    place_id:           row.place_id ?? "",
+    rating:             row.rating ?? null,
+    user_ratings_total: row.user_ratings_total ?? null,
+    maps_url:           row.maps_url ?? "",
+    business_status:    row.business_status ?? "",
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// CONTACT SUMMARY BUILDER
+// ─────────────────────────────────────────────────────────────
 
 /**
- * Validates CSV rows and separates valid leads from errors
+ * Gradi finalni contact_summary od bogatih podataka iz collectContactDetails
+ * i CSV leada. Uvek vraca konzistentan objekat, cak i pri partial/failed.
+ *
+ * @param {Object} lead          - normalizovani lead iz CSV-a
+ * @param {Object|null} details  - rezultat collectContactDetails(), ili null
  */
-function validateLeads(rows) {
-  const validLeads = [];
-  const errors = [];
+function buildContactSummary(lead, details) {
+  const crawledPhones = details?.phones ?? [];
+  const crawledEmails = details?.emails ?? [];
+  const ctaLinks      = details?.cta_links ?? [];
+  const crawledPages  = details?.crawled_pages ?? [];
 
-  rows.forEach((row, index) => {
-    const result = LeadSchema.safeParse(row);
-    
-    if (result.success) {
-      validLeads.push(result.data);
-    } else {
-      errors.push({
-        row: index + 2,
-        data: row,
-        issues: result.error.issues,
-      });
-    }
-  });
+  const csvPhone  = lead.phone ? String(lead.phone).trim() : null;
+  const allPhones = csvPhone && !crawledPhones.includes(csvPhone)
+    ? [csvPhone, ...crawledPhones]
+    : [...crawledPhones];
 
-  return { validLeads, errors };
+  const phoneSource = (() => {
+    if (crawledPhones.length > 0 && csvPhone) return "website+csv";
+    if (crawledPhones.length > 0)             return "website";
+    if (csvPhone)                             return "csv_only";
+    return "none";
+  })();
+
+  return {
+    phones:        allPhones,
+    emails:        crawledEmails,
+    // Booking/kontakt CTA linkovi - "Request Appointment", "Book Now" itd.
+    // Svaki: { text, href, score, found_on }
+    cta_links:     ctaLinks,
+    // Sta je nadjeno na kojoj stranici (za debug/audit)
+    per_page:      details?.per_page ?? [],
+    phones_count:  allPhones.length,
+    emails_count:  crawledEmails.length,
+    cta_count:     ctaLinks.length,
+    crawled_pages: crawledPages,
+    pages_crawled: crawledPages.length,
+    phone_source:  phoneSource,
+  };
 }
 
-function logValidationSummary(validation) {
-  console.log("\n" + "=".repeat(70));
-  console.log("📋 STAGE 1: DATA COLLECTION - VALIDATION SUMMARY");
-  console.log("=".repeat(70));
-  console.log(`✅ Valid leads: ${validation.validLeads.length}`);
-  
-  if (validation.errors.length > 0) {
-    console.log(`❌ Invalid rows: ${validation.errors.length}`);
-    console.log("\nValidation errors:");
-    validation.errors.slice(0, 5).forEach(error => {
-      console.log(`  Row ${error.row}:`);
-      error.issues.forEach(issue => {
-        console.log(`    • ${issue.path.join(".")}: ${issue.message}`);
-      });
-    });
-    if (validation.errors.length > 5) {
-      console.log(`  ... and ${validation.errors.length - 5} more errors`);
-    }
-  }
-  
-  console.log("=".repeat(70) + "\n");
+// ─────────────────────────────────────────────────────────────
+// PRIKUPLJANJE PODATAKA PO LEADU
+// ─────────────────────────────────────────────────────────────
+
+async function collectPageSpeed(url) {
+  console.log("  Pagespeed (mobile + desktop)...");
+  const [mobile, desktop] = await Promise.all([
+    runPageSpeed({ url, strategy: "mobile",  apiKey: CONFIG.PSI_API_KEY }),
+    runPageSpeed({ url, strategy: "desktop", apiKey: CONFIG.PSI_API_KEY }),
+  ]);
+  console.log(`  Mobile: ${mobile.categories.performance} | Desktop: ${desktop.categories.performance}`);
+  return { mobile, desktop };
 }
 
-// ============================================================
-// PROGRESS TRACKING
-// ============================================================
-
-class DataCollectionProgress {
-  constructor(total) {
-    this.total = total;
-    this.current = 0;
-    this.startTime = Date.now();
-    this.successful = 0;
-    this.failed = 0;
-    this.partial = 0;
-    this.skipped = 0;
-  }
-
-  update(status) {
-    this.current++;
-    
-    switch (status) {
-      case ResultStatus.SUCCESS:
-        this.successful++;
-        break;
-      case ResultStatus.PARTIAL:
-        this.partial++;
-        break;
-      case ResultStatus.FAILED:
-        this.failed++;
-        break;
-      case "skipped":
-        this.skipped++;
-        break;
-    }
-  }
-
-  getPercentage() {
-    return Math.round((this.current / this.total) * 100);
-  }
-
-  getETA() {
-    if (this.current === 0) return "calculating...";
-    
-    const elapsed = Date.now() - this.startTime;
-    const avgTime = elapsed / this.current;
-    const remaining = (this.total - this.current) * avgTime;
-    
-    const minutes = Math.floor(remaining / 60000);
-    const seconds = Math.floor((remaining % 60000) / 1000);
-    
-    return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
-  }
-
-  logHeader(lead) {
-    console.log("\n" + "─".repeat(70));
-    console.log(`📦 [${this.current + 1}/${this.total}] ${this.getPercentage()}% • ETA: ${this.getETA()}`);
-    console.log(`🌐 ${lead.website_url}`);
-    console.log("─".repeat(70));
-  }
-
-  logFinalSummary() {
-    const duration = Math.round((Date.now() - this.startTime) / 1000);
-    
-    console.log("\n" + "=".repeat(70));
-    console.log("🎉 STAGE 1 COMPLETE: DATA COLLECTION");
-    console.log("=".repeat(70));
-    console.log(`Total processed: ${this.total}`);
-    console.log(`✅ Complete data: ${this.successful}`);
-    if (this.partial > 0) {
-      console.log(`⚠️  Partial data: ${this.partial}`);
-    }
-    if (this.failed > 0) {
-      console.log(`❌ Failed: ${this.failed}`);
-    }
-    if (this.skipped > 0) {
-      console.log(`⏭️  Skipped (already exist): ${this.skipped}`);
-    }
-    console.log(`⏱️  Duration: ${duration}s (avg: ${(duration / this.total).toFixed(1)}s per lead)`);
-    console.log("\n📁 Output directory: " + PIPELINE_CONFIG.OUTPUT_DIR);
-    console.log("=".repeat(70) + "\n");
-    
-    console.log("🔄 Next step: Run Stage 2 (Analysis)");
-    console.log("   Command: node src/analyze_batch.js\n");
-  }
+async function collectSignalsData(url) {
+  console.log("  Signali (tracking, chatbot, booking, SEO)...");
+  const signals = await collectSignals(url);
+  const trackingCount = Object.values(signals.tracking ?? {}).filter(Boolean).length;
+  console.log(`  Chatbot: ${signals.chatbot?.vendor || "nema"} | Tracking: ${trackingCount} alata`);
+  return signals;
 }
 
-// ============================================================
-// PIPELINE STAGES
-// ============================================================
-
-async function executePageSpeedStage(url) {
-  console.log("  📊 PageSpeed Insights...");
-  
-  try {
-    const [mobile, desktop] = await Promise.all([
-      runPageSpeed({ url, strategy: "mobile", apiKey: CONFIG.PSI_API_KEY }),
-      runPageSpeed({ url, strategy: "desktop", apiKey: CONFIG.PSI_API_KEY }),
-    ]);
-
-    const mobileScore = mobile.categories.performance;
-    const desktopScore = desktop.categories.performance;
-    console.log(`    ✅ Mobile: ${mobileScore}% | Desktop: ${desktopScore}%`);
-    
-    return { mobile, desktop };
-  } catch (error) {
-    console.log(`    ❌ Failed: ${error.message}`);
-    throw error;
-  }
+async function collectContactData(url) {
+  console.log("  Kontakti & CTA linkovi...");
+  const details = await collectContactDetails(url);
+  console.log(`  Tel: ${details.phones.length} | Email: ${details.emails.length} | CTA: ${details.cta_links.length} linkova`);
+  return details;
 }
 
-async function executeSignalsStage(url) {
-  console.log("  🔍 Signals collection...");
-  
-  try {
-    const signals = await collectSignals(url);
-    
-    const chatbot = signals.chatbot.has_chatbot ? signals.chatbot.vendor : "none";
-    const booking = signals.booking.type || "none";
-    
-    console.log(`    ✅ Chat: ${chatbot} | Booking: ${booking}`);
-    
-    return signals;
-  } catch (error) {
-    console.log(`    ❌ Failed: ${error.message}`);
-    throw error;
-  }
-}
-
-async function executeCruxStage(url) {
-  console.log("  📈 CrUX data...");
-  
+async function collectCrux(url) {
+  console.log("  CrUX (real-user podaci)...");
   try {
     const crux = await getCrux({
       websiteUrl: url,
@@ -234,257 +184,189 @@ async function executeCruxStage(url) {
       formFactor: "PHONE",
       includePage: false,
     });
-    
-    const category = crux?.origin?.overall_category || "unknown";
-    console.log(`    ✅ CrUX: ${category}`);
-    
+    console.log(`  CrUX: ${crux?.origin?.overall_category ?? "nema podataka"}`);
     return crux;
-  } catch (error) {
-    console.log(`    ⚠️  CrUX unavailable (${error.message})`);
+  } catch (e) {
+    console.log(`  CrUX nije dostupan: ${e.message}`);
     return null;
   }
 }
 
-async function executeStackStage(url) {
-  console.log("  🔧 Stack detection...");
-  
+async function collectStack(url) {
+  console.log("  Stack detekcija...");
   try {
-    const response = await fetchHtmlWithHeaders(url);
+    const page  = await fetchHtmlWithHeaders(url);
     const stack = {
-      fetched_from: response.finalUrl,
-      status: response.status,
-      ...detectStack({ html: response.html, headers: response.headers }),
+      fetched_from: page.finalUrl,
+      status:       page.status,
+      ...detectStack({ html: page.html, headers: page.headers }),
     };
-    
-    const techCount = stack.technologies?.length || 0;
-    console.log(`    ✅ ${techCount} technologies detected`);
-    
+    console.log(`  CMS: ${stack.cms || "nepoznat"} | Server: ${stack.server || "nepoznat"}`);
     return stack;
-  } catch (error) {
-    console.log(`    ⚠️  Stack unavailable (${error.message})`);
+  } catch (e) {
+    console.log(`  Stack detekcija neuspesna: ${e.message}`);
     return null;
   }
 }
 
-// ============================================================
-// FILE MANAGEMENT
-// ============================================================
+// ─────────────────────────────────────────────────────────────
+// OBRADA JEDNOG LEADA
+// ─────────────────────────────────────────────────────────────
 
-function getOutputFilePath(lead) {
-  const filename = sanitizeFileName(lead.website_url) + ".json";
-  return `${PIPELINE_CONFIG.OUTPUT_DIR}/${filename}`;
+function getOutputPath(lead) {
+  return `${CONFIG.OUT_DIR}/${sanitizeFileName(lead.website_url)}.json`;
 }
 
-function checkIfAlreadyProcessed(lead) {
-  const filepath = getOutputFilePath(lead);
-  try {
-    return fs.existsSync(filepath);
-  } catch {
-    return false;
-  }
-}
+async function processLead(lead, options = {}) {
+  const outputPath = getOutputPath(lead);
 
-async function saveLeadData(lead, result) {
-  const filepath = getOutputFilePath(lead);
-  writeJson(filepath, { item: result });
-  return filepath;
-}
-
-// ============================================================
-// LEAD PROCESSING
-// ============================================================
-
-async function processLead(lead, progress, options = {}) {
-  progress.logHeader(lead);
-
-  // Check if already processed (skip if force=false)
-  if (!options.force && await checkIfAlreadyProcessed(lead)) {
-    console.log("  ⏭️  Already processed (use --force to reprocess)");
-    progress.update("skipped");
-    return null;
+  if (!options.force && fs.existsSync(outputPath)) {
+    console.log(`  Preskocan (vec postoji). --force za ponovnu obradu.`);
+    return { status: "skipped" };
   }
 
   const result = {
     lead,
-    status: ResultStatus.SUCCESS,
-    error: null,
-    errors: {},
-    pagespeed: null,
-    signals: null,
-    crux: null,
-    stack: null,
-    processed_at: new Date().toISOString(),
-    pipeline_stage: "data_collection",
-    pipeline_version: "1.0.0",
+    status:          "ok",
+    error:           null,
+    pagespeed:       null,
+    signals:         null,
+    crux:            null,
+    stack:           null,
+    contact_summary: null,
+    processed_at:    new Date().toISOString(),
   };
 
-  let criticalFailure = false;
-
-  // Stage 1: PageSpeed (Critical)
+  // PageSpeed je kritican
   try {
-    result.pagespeed = await executePageSpeedStage(lead.website_url);
-  } catch (error) {
-    result.errors[ProcessingStage.PAGESPEED] = error.message;
-    criticalFailure = true;
+    result.pagespeed = await withRetries(
+      () => collectPageSpeed(lead.website_url),
+      "PageSpeed",
+      CONFIG.MAX_RETRIES
+    );
+  } catch (e) {
+    result.status          = "failed";
+    result.error           = `PageSpeed failed: ${e.message}`;
+    result.contact_summary = buildContactSummary(lead, null);
+    writeJson(outputPath, { item: result });
+    return { status: "failed" };
   }
 
-  // Stage 2: Signals (Critical)
-  if (!criticalFailure) {
-    try {
-      result.signals = await executeSignalsStage(lead.website_url);
-    } catch (error) {
-      result.errors[ProcessingStage.SIGNALS] = error.message;
-      criticalFailure = true;
-    }
+  // Signals: tracking, chatbot, booking, SEO
+  try {
+    result.signals = await withRetries(
+      () => collectSignalsData(lead.website_url),
+      "Signals",
+      CONFIG.MAX_RETRIES
+    );
+  } catch (e) {
+    result.status = "partial";
+    result.error  = `Signals failed: ${e.message}`;
   }
 
-  // Stage 3: CrUX (Optional)
-  if (!criticalFailure) {
-    const crux = await executeCruxStage(lead.website_url);
-    if (crux) {
-      result.crux = crux;
-    } else {
-      result.errors[ProcessingStage.CRUX] = "Data unavailable";
-    }
+  // Contact details: phones, emails, CTA linkovi
+  let contactDetails = null;
+  try {
+    contactDetails = await withRetries(
+      () => collectContactData(lead.website_url),
+      "ContactDetails",
+      CONFIG.MAX_RETRIES
+    );
+  } catch (e) {
+    if (!result.error) result.error = `ContactDetails failed: ${e.message}`;
+    if (result.status === "ok") result.status = "partial";
   }
 
-  // Stage 4: Stack (Optional)
-  if (!criticalFailure) {
-    const stack = await executeStackStage(lead.website_url);
-    if (stack) {
-      result.stack = stack;
-    } else {
-      result.errors[ProcessingStage.STACK] = "Detection unavailable";
-    }
-  }
+  result.contact_summary = buildContactSummary(lead, contactDetails);
 
-  // Determine status
-  if (criticalFailure) {
-    result.status = ResultStatus.FAILED;
-    result.error = "Critical stage failed";
-  } else if (Object.keys(result.errors).length > 0) {
-    result.status = ResultStatus.PARTIAL;
-  }
+  const cs = result.contact_summary;
+  console.log(
+    `  Kontakti: ${cs.phones_count} tel (${cs.phone_source}) | ${cs.emails_count} email | ${cs.cta_count} CTA | ${cs.pages_crawled} str.`
+  );
 
-  // Log summary
-  logResultSummary(result);
+  // CrUX i Stack su opcioni
+  result.crux  = await collectCrux(lead.website_url);
+  result.stack = await collectStack(lead.website_url);
 
-  // Save to file
-  const filepath = await saveLeadData(lead, result);
-  console.log(`  💾 Saved: ${filepath}`);
+  writeJson(outputPath, { item: result });
+  console.log(`  Sacuvano: ${outputPath}`);
 
-  progress.update(result.status);
-  
-  return result;
+  return { status: result.status };
 }
 
-function logResultSummary(result) {
-  const icons = {
-    [ResultStatus.SUCCESS]: "✅",
-    [ResultStatus.PARTIAL]: "⚠️",
-    [ResultStatus.FAILED]: "❌",
-  };
-
-  console.log(`\n  ${icons[result.status]} Status: ${result.status.toUpperCase()}`);
-  
-  if (Object.keys(result.errors).length > 0) {
-    console.log("  Issues:");
-    Object.entries(result.errors).forEach(([stage, error]) => {
-      console.log(`    • ${stage}: ${error}`);
-    });
-  }
-}
-
-// ============================================================
-// BATCH PROCESSING
-// ============================================================
-
-async function processBatch(leads, options = {}) {
-  const progress = new DataCollectionProgress(leads.length);
-  const results = [];
-
-  for (const lead of leads) {
-    try {
-      const result = await processLead(lead, progress, options);
-      if (result) {
-        results.push(result);
-      }
-      
-      // Rate limiting
-      if (progress.current < leads.length) {
-        await sleep(CONFIG.DELAY_MS);
-      }
-    } catch (error) {
-      console.error(`  ❌ Unexpected error: ${error.message}`);
-      progress.update(ResultStatus.FAILED);
-    }
-  }
-
-  progress.logFinalSummary();
-  
-  return results;
-}
-
-// ============================================================
+// ─────────────────────────────────────────────────────────────
 // MAIN
-// ============================================================
+// ─────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log("\n🚀 LEAD ENRICHMENT PIPELINE - STAGE 1: DATA COLLECTION\n");
+  console.log("\n STAGE 1: PRIKUPLJANJE PODATAKA\n");
 
-  try {
-    // Setup
-    ensureDir(PIPELINE_CONFIG.OUTPUT_DIR);
+  ensureDir(CONFIG.OUT_DIR);
 
-    // Load CSV
-    console.log("📂 Loading leads from CSV...");
-    const rows = readCsv(CONFIG.LEADS_CSV);
-    console.log(`   Loaded ${rows.length} rows`);
+  const args  = process.argv.slice(2);
+  const force = args.includes("--force") || args.includes("-f");
+  if (force) console.log("Force mode: ponavljam sve leadove\n");
 
-    // Validate
-    const validation = validateLeads(rows);
-    logValidationSummary(validation);
+  const rows = readCsv(CONFIG.LEADS_CSV);
+  console.log(`Ucitano redova: ${rows.length}`);
 
-    if (validation.validLeads.length === 0) {
-      console.error("❌ No valid leads found. Exiting.");
-      process.exit(1);
+  const leads  = [];
+  const errors = [];
+
+  rows.forEach((row, i) => {
+    const normalized = normalizeLead(row);
+    const parsed     = LeadSchema.safeParse(normalized);
+    if (parsed.success) {
+      leads.push(parsed.data);
+    } else {
+      errors.push({ row: i + 2, url: row.website_url ?? row.website, issues: parsed.error.issues });
     }
+  });
 
-    // Apply test limit
-    const leadsToProcess = CONFIG.TEST_LIMIT > 0
-      ? validation.validLeads.slice(0, CONFIG.TEST_LIMIT)
-      : validation.validLeads;
+  console.log(`Validnih leadova: ${leads.length}`);
+  if (errors.length) {
+    console.log(`Nevalidnih redova: ${errors.length}`);
+    errors.slice(0, 3).forEach(e =>
+      console.log(`   Red ${e.row} (${e.url}): ${e.issues.map(i => i.message).join(", ")}`)
+    );
+  }
 
-    if (CONFIG.TEST_LIMIT > 0) {
-      console.log(`🧪 TEST MODE: Processing first ${leadsToProcess.length} leads\n`);
-    }
-
-    // Parse CLI arguments
-    const args = process.argv.slice(2);
-    const options = {
-      force: args.includes("--force") || args.includes("-f"),
-    };
-
-    if (options.force) {
-      console.log("🔄 Force mode: Re-processing all leads\n");
-    }
-
-    // Process
-    console.log(`⚙️  Starting data collection (${leadsToProcess.length} leads)...\n`);
-    await processBatch(leadsToProcess, options);
-
-  } catch (error) {
-    console.error("\n❌ FATAL ERROR:", error.message);
-    console.error(error.stack);
+  if (!leads.length) {
+    console.error("Nema validnih leadova. Provjeri CSV fajl i LEADS_CSV u .env");
     process.exit(1);
   }
+
+  const toProcess = CONFIG.TEST_LIMIT > 0 ? leads.slice(0, CONFIG.TEST_LIMIT) : leads;
+  if (CONFIG.TEST_LIMIT > 0) console.log(`TEST MODE: obradjujem prvih ${toProcess.length}\n`);
+
+  let ok = 0, failed = 0, skipped = 0;
+  const total = toProcess.length;
+
+  for (let i = 0; i < total; i++) {
+    const lead = toProcess[i];
+    const pct  = Math.round(((i + 1) / total) * 100);
+
+    console.log("\n" + "-".repeat(60));
+    console.log(`[${i + 1}/${total}] ${pct}% -> ${lead.website_url}`);
+    console.log("-".repeat(60));
+
+    const res = await processLead(lead, { force });
+    if (res.status === "ok" || res.status === "partial") ok++;
+    else if (res.status === "failed") failed++;
+    else skipped++;
+
+    if (i < total - 1) await sleep(CONFIG.DELAY_MS);
+  }
+
+  console.log("\n" + "=".repeat(60));
+  console.log("STAGE 1 ZAVRSEN");
+  console.log(`   Uspesno: ${ok} | Neuspesno: ${failed} | Preskoceno: ${skipped}`);
+  console.log(`   Fajlovi: ${CONFIG.OUT_DIR}/`);
+  console.log("=".repeat(60));
+  console.log("\n Sledeci korak: node src/analyze_batch.js\n");
 }
 
-// ============================================================
-// ENTRY POINT
-// ============================================================
-
-main().catch((error) => {
-  console.error("\n❌ Unhandled error:", error.message);
+main().catch(e => {
+  console.error("Fatalna greska:", e.message);
   process.exit(1);
 });
