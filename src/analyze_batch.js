@@ -1,30 +1,43 @@
 // ============================================================
 // analyze_batch.js - STAGE 2: AI Analiza leadova
 // ============================================================
-// Ulaz : out/*.json (call report iz pagespeed-reporter.js)
-// Izlaz: out/final/{basename}.json
-//        out/report/{basename}.csv
+// Ulaz : out/*.json  (Stage 1 output iz index.js)
+// Izlaz: out/final/{basename}.json   — enriched lead pack
+//        out/report/{basename}.csv   — Zoho-ready CSV
+//
+// FLOW PO LEADU:
+//   1. Učitaj Stage 1 JSON
+//   2. buildCallReport()   → bogati callReport (health, vitals, temp)
+//   3. scrapeSiteSnapshot() → svež sadržaj sajta
+//   4. analyzeLeadWithDeepSeek() → 4-pass AI analiza (dentist jezik)
+//   5. summarizeSite()     → services, tone, booking
+//   6. buildLeadPack()     → čist pack objekat
+//   7. enrichLead()        → 6 AI poziva za Zoho polja
+//   8. Sačuvaj JSON + CSV
 //
 // Pokretanje:
 //   node src/analyze_batch.js
-//   node src/analyze_batch.js --force
+//   node src/analyze_batch.js --force   ← ponovi sve, ignoriši keš
 // ============================================================
 
-import fs from "fs";
+import fs   from "fs";
 import path from "path";
-import { CONFIG } from "./config.js";
-import { readJson } from "./io/readJson.js";
-import { writeJson } from "./io/write.js";
-import { sleep, withRetries } from "./utils/helpers.js";
+import { CONFIG }                  from "./config.js";
+import { readJson }                from "./io/readJson.js";
+import { writeJson }               from "./io/write.js";
+import { sleep, withRetries }      from "./utils/helpers.js";
+import { buildCallReport }         from "./pagespeed/batch-reporter.js";
 import { analyzeLeadWithDeepSeek } from "./ai/analyzeLead.js";
-import { scrapeSiteSnapshot } from "./utils/siteScrape.js";
-import { summarizeSite } from "./ai/checkHtmlAndUrl.js";
-import { buildLeadPack } from "./ai/buildLeadPack.js";
-import { leadPackToCsv } from "./ai/createFinalReport.js";
-import { enrichLead } from "./ai/enrichLead.js";
+import { scrapeSiteSnapshot }      from "./utils/siteScrape.js";
+import { summarizeSite }           from "./ai/checkHtmlAndUrl.js";
+import { buildLeadPack }           from "./ai/buildLeadPack.js";
+import { enrichLead }              from "./ai/enrichLead.js";
+import { leadPackToCsv }           from "./ai/createFinalReport.js";
+import { buildSignalReport } from "./ai/buildSignalReport.js";
+import { ca } from "zod/v4/locales";
 
 // ─────────────────────────────────────────────────────────────
-// DISCOVERY
+// DISCOVERY — pronađi sve Stage 1 JSON fajlove
 // ─────────────────────────────────────────────────────────────
 
 function findRawLeadFiles() {
@@ -50,9 +63,7 @@ function isAlreadyAnalyzed(basename) {
 // OBRADA JEDNOG FAJLA
 // ─────────────────────────────────────────────────────────────
 
-async function processFile(fileInfo, options) {
-  const { filename, filepath, basename } = fileInfo;
-
+async function processFile({ filename, filepath, basename }, options) {
   console.log("\n" + "─".repeat(60));
   console.log(`📄 ${filename}`);
 
@@ -64,156 +75,76 @@ async function processFile(fileInfo, options) {
   let callReport = null;
 
   try {
-    // 1. Učitaj Stage 1 podatke — podržavamo oba formata:
-    //    A) Novi: flat call report  { name, website_url, scores, tracking, ... }
-    //    B) Stari: wrapped format   { item: { lead: { website_url }, pagespeed, signals, ... } }
+    // ── 1. Učitaj Stage 1 JSON ─────────────────────────────
     const raw = readJson(filepath);
 
-    if (raw?.website_url) {
-      // Format A — novi flat call report
-      callReport = raw;
-    } else if (raw?.item?.lead?.website_url) {
-      // Format B — stari wrapped format, konvertuj u call report strukturu
-      const item = raw.item;
-      const lead = item.lead;
-
-      if (item.status === "failed") {
-        console.log("⏭️  Preskočen (Stage 1 = failed).");
-        return { status: "skipped" };
-      }
-
-      const ps = item.pagespeed || {};
-      const sig = item.signals  || {};
-      const t   = sig.tracking  || {};
-      const b   = sig.booking   || {};
-      const seo = sig.seo       || {};
-      const stk = item.stack    || {};
-
-      // Normalizuj u flat strukturu kompatibilnu sa novim kodom
-      callReport = {
-        name:          lead.name,
-        website_url:   lead.website_url,
-        address:       lead.address ?? null,
-        processed_at:  item.processed_at ?? null,
-        health_score:  null,
-        health_grade:  null,
-
-        phones:             item.contact_summary?.phones ?? [],
-        emails:             item.contact_summary?.emails ?? [],
-        has_online_booking: !!(b.type && b.type !== "unknown"),
-        booking_type:       b.type   ?? "unknown",
-        booking_vendor:     b.vendor ?? null,
-        ctas:               [],
-
-        seo: seo ? {
-          has_title:            !!seo.title,
-          title:                seo.title ?? null,
-          has_meta_description: !!(seo.meta_description),
-          has_canonical:        !!(seo.canonical),
-          has_open_graph:       !!(seo.open_graph?.og_title),
-          has_twitter_card:     !!(seo.twitter_card?.twitter_card),
-          h1_count:             seo.content_analysis?.h1_count ?? null,
-          h1_text:              seo.content_analysis?.h1_text  ?? null,
-          word_count:           seo.content_analysis?.word_count ?? null,
-          image_count:          seo.content_analysis?.image_count ?? null,
-          images_without_alt:   seo.content_analysis?.images_without_alt ?? null,
-          has_structured_data:  !!(seo.structured_data?.length),
-          structured_data_type: seo.structured_data?.[0]?.["@type"] ?? null,
-          has_https_forms:      !!(seo.security?.has_https_forms),
-          has_lazy_loading:     !!(seo.performance_hints?.has_lazy_loading),
-          has_async_scripts:    !!(seo.performance_hints?.has_async_scripts),
-        } : null,
-
-        tracking: {
-          has_ga4:        t.ga4         ?? false,
-          has_gtm:        t.gtm         ?? false,
-          has_meta_pixel: t.meta_pixel  ?? false,
-          has_google_ads: t.google_ads  ?? false,
-          has_chatbot:    !!(sig.chatbot?.has_chatbot),
-          chatbot_vendor: sig.chatbot?.vendor ?? null,
-        },
-
-        scores: {
-          mobile_perf:  ps.mobile?.categories?.performance  ?? null,
-          mobile_seo:   ps.mobile?.categories?.seo          ?? null,
-          mobile_acc:   ps.mobile?.categories?.accessibility ?? null,
-          mobile_bp:    ps.mobile?.categories?.best_practices ?? null,
-          desktop_perf: ps.desktop?.categories?.performance  ?? null,
-          desktop_seo:  ps.desktop?.categories?.seo          ?? null,
-          desktop_acc:  ps.desktop?.categories?.accessibility ?? null,
-          desktop_bp:   ps.desktop?.categories?.best_practices ?? null,
-        },
-
-        vitals_mobile:    {},
-        resources_mobile: {},
-
-        tech_stack: (stk.technologies ?? [])
-          .map(t => ({ name: t.name, category: t.category, confidence: Math.round((t.confidence ?? 0) * 100) }))
-          .sort((a, b) => b.confidence - a.confidence)
-          .slice(0, 8),
-
-        lead_temperature: null,
-      };
-
-      console.log("ℹ️  Stari format detektovan — konvertovan u call report strukturu");
-    } else {
-      throw new Error("Neispravan format fajla: nedostaje website_url ili item.lead.website_url");
+    if (!raw?.item?.lead?.website_url) {
+      throw new Error("Neispravan format: nedostaje item.lead.website_url");
+    }
+    if (raw.item.status === "failed") {
+      console.log("⏭️  Preskočen (Stage 1 = failed).");
+      return { status: "skipped" };
     }
 
-    const url = callReport.website_url;
-    console.log(`🌐 ${url}`);
+    // ── 2. buildCallReport() ───────────────────────────────
+    // Parsira pagespeed, signals, stack iz Stage 1 JSON i vraća:
+    //   health_score, health_grade, lead_temperature,
+    //   scores, vitals_mobile, resources_mobile,
+    //   tracking, seo, booking, tech_stack,
+    //   phones, emails, ctas, description
+    callReport = buildCallReport(raw);
+    //console.log(`✅ Call report: health=${callReport.health_score}/100 (${callReport.health_grade}) | temp=${callReport.lead_temperature?.label ?? "N/A"}`, callReport);
+    // Sačuvaj originalni lead za Zoho polja (name, phone, address, city...)
+    callReport._originalLead = raw.item.lead;
+    const callReportAnalyze = await withRetries(
+      () => buildSignalReport(callReport),
+      "Optimizovanje call reporta za AI",
+      CONFIG.MAX_RETRIES
+    );
 
-    // 2. Scrape sajta PRVO — rezultat ide i u AI analizu i u sumarizaciju
+    const url = callReport.website_url;
+    if (!url) throw new Error("buildCallReport nije vratio website_url");
+
+    console.log(`🌐 ${url}`);
+    console.log(`   Health: ${callReport.health_score}/100 (${callReport.health_grade}) | Temp: ${callReport.lead_temperature?.label ?? "N/A"}`);
+    console.log(`   Mobile: ${callReport.scores?.mobile_perf}/100 | Desktop: ${callReport.scores?.desktop_perf}/100`);
+
+    // ── 3. Scrape sajta ────────────────────────────────────
     const scrapeResult = await withRetries(
       () => scrapeSiteSnapshot(url),
       "Scrape sajta",
       CONFIG.MAX_RETRIES
     );
 
-    if (!scrapeResult.ok) {
-      console.log(`⚠️  Scrape neuspešan: ${scrapeResult.error}`);
-    } else {
+    if (scrapeResult.ok) {
       console.log(`✅ Scrape: ${scrapeResult.extraPages?.length ?? 0} extra stranica`);
+    } else {
+      console.log(`⚠️  Scrape neuspešan: ${scrapeResult.error}`);
     }
 
-    // 3. AI analiza — prima ceo call report + scrape
+    // ── 4. AI analiza (4 fokusirana passa) ────────────────
+    // Pass 1: brzina (patient impact)
+    // Pass 2: SEO / Google vidljivost
+    // Pass 3: zakazivanje & konverzija
+    // Pass 4: sinteza → score, problems, pitch, email hooks
     const analysis = await withRetries(
       () => analyzeLeadWithDeepSeek({
-        callReport,
+        callReport: callReportAnalyze,
         scrapeBase: scrapeResult?.base ?? null,
       }),
       "AI analiza",
       CONFIG.MAX_RETRIES
     );
-    console.log(`✅ AI analiza: skor=${analysis.score}/100 | prioritet=${analysis.priority}`);
-
-    // 4. Sumiraj sadržaj sajta
-    const siteSummary = scrapeResult.ok
-      ? await withRetries(
-          () => summarizeSite({ url, tokens: scrapeResult.tokens }),
-          "Sumarizacija sajta",
-          CONFIG.MAX_RETRIES
-        )
-      : { summary: "Sajt nije bio dostupan.", services: [], tone: "unknown" };
-
-    console.log("✅ Sajt sumarizovan");
-
-    // 5. Složi finalni lead pack
-    // lead objekat pravimo iz call reporta za kompatibilnost sa buildLeadPack/enrichLead
-    const lead = {
-      name:        callReport.name,
-      website_url: callReport.website_url,
-      address:     callReport.address,
-    };
-
-    const leadPack = await withRetries(
-      () => buildLeadPack({ lead, analysis, siteSummary }),
-      "Build lead pack",
-      CONFIG.MAX_RETRIES
-    );
-    console.log("✅ Lead pack kreiran");
-
-    // 6. Enrichment — mali fokusirani AI pozivi
+    console.log("✅ AI analiza završena",);
+    // ── 6. Build lead pack ────────────────────────────────
+    const leadPack = await buildLeadPack({
+      lead:        callReport._originalLead,
+      analysis,
+    });
+    console.log("✅ Lead pack kreiran", leadPack);
+    // ── 7. Enrichment — 6 AI poziva za Zoho polja ─────────
+    // enrichLead koristi analysis._passes (speed/seo/conversion)
+    // koji su već izračunati u koraku 4 — nema duplog rada
     const enrichedPack = await withRetries(
       () => enrichLead({ leadPack, analysis, item: callReport }),
       "Enrichment",
@@ -221,12 +152,22 @@ async function processFile(fileInfo, options) {
     );
     console.log("✅ Enrichment završen");
 
-    // 7. Sačuvaj izlaze
-    fs.mkdirSync(CONFIG.FINAL_DIR, { recursive: true });
+    // ── 8. Sačuvaj outpute ────────────────────────────────
+    fs.mkdirSync(CONFIG.FINAL_DIR,  { recursive: true });
     fs.mkdirSync(CONFIG.REPORT_DIR, { recursive: true });
 
-    const jsonPath = path.join(CONFIG.FINAL_DIR, `${basename}.json`);
+    const jsonPath = path.join(CONFIG.FINAL_DIR,  `${basename}.json`);
     const csvPath  = path.join(CONFIG.REPORT_DIR, `${basename}.csv`);
+
+    // Dodaj call report snapshot u final JSON (bez _originalLead koji
+    // je već u enrichedPack.lead)
+    delete enrichedPack._originalLead;
+    enrichedPack._callReport = {
+      health_score:     callReport.health_score,
+      health_grade:     callReport.health_grade,
+      lead_temperature: callReport.lead_temperature,
+      description:      callReport.description,
+    };
 
     writeJson(jsonPath, enrichedPack);
     await leadPackToCsv(enrichedPack, csvPath);
@@ -240,14 +181,14 @@ async function processFile(fileInfo, options) {
     console.log(`❌ Greška: ${err?.message || err}`);
 
     fs.mkdirSync(CONFIG.FINAL_DIR, { recursive: true });
-    const errorPath = path.join(CONFIG.FINAL_DIR, `${basename}.error.json`);
-    writeJson(errorPath, {
-      lead:      { name: callReport?.name, website_url: callReport?.website_url },
+    writeJson(path.join(CONFIG.FINAL_DIR, `${basename}.error.json`), {
+      lead:      { website_url: callReport?.website_url },
       error:     { message: err?.message, stack: err?.stack },
       timestamp: new Date().toISOString(),
     });
 
     return { status: "failed" };
+
   } finally {
     await sleep(CONFIG.DELAY_MS);
   }
@@ -272,7 +213,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`📦 Pronađeno fajlova: ${files.length}`);
+  console.log(`📦 Pronađeno fajlova: ${files.length}\n`);
 
   let ok = 0, failed = 0, skipped = 0;
 
@@ -285,9 +226,11 @@ async function main() {
 
   console.log("\n" + "=".repeat(60));
   console.log("✅ STAGE 2 ZAVRŠEN");
-  console.log(`   Uspešno: ${ok} | Neuspešno: ${failed} | Preskočeno: ${skipped}`);
-  console.log(`   JSON:    ${CONFIG.FINAL_DIR}/`);
-  console.log(`   CSV:     ${CONFIG.REPORT_DIR}/`);
+  console.log(`   Uspešno:    ${ok}`);
+  console.log(`   Neuspešno:  ${failed}`);
+  console.log(`   Preskočeno: ${skipped}`);
+  console.log(`   JSON:  ${CONFIG.FINAL_DIR}/`);
+  console.log(`   CSV:   ${CONFIG.REPORT_DIR}/`);
   console.log("=".repeat(60) + "\n");
 }
 

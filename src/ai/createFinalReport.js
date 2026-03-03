@@ -1,22 +1,25 @@
 // ============================================================
 // ai/createFinalReport.js — Zoho Leads CSV export
 // ============================================================
-// STANDARD ZOHO FIELDS (already exist in Zoho — do not create):
+// STANDARD ZOHO FIELDS (exist by default — do not create):
 //   First Name, Last Name, Company, Phone, Email, Website,
 //   Street, City, State, Zip Code, Country,
 //   Lead Source, Lead Status, Industry, Description
 //
-// CUSTOM FIELDS to create in Zoho (Settings → Modules → Leads):
-//   Multi Line (6): Cold Email Text, Call Script, Website Issues,
-//                   Agent Briefing, Pitch, Lead Recap
-//   (Cold Email Text includes subject line on first line)
+// CREATE THESE 6 CUSTOM FIELDS in Zoho (all Multi Line):
+//   Cold Email Text  — Subject on line 1, then ---, then email body
+//   Call Script      — 30-second opener
+//   Website Issues   — Factual problems with numbers
+//   Agent Briefing   — WHO / PROBLEM / WE OFFER / BUDGET / CALL GOAL
+//   Pitch            — Why contact them + expected ROI
+//   Lead Recap       — All key metrics in one glance
 // ============================================================
 
-import fs from "fs";
+import fs   from "fs";
 import path from "path";
 
 const ZOHO_COLUMNS = [
-  // ── STANDARD ZOHO LEADS (do not rename) ───────────────────
+  // Standard Zoho Leads (do not rename)
   "First Name",
   "Last Name",
   "Company",
@@ -28,24 +31,22 @@ const ZOHO_COLUMNS = [
   "State",
   "Zip Code",
   "Country",
-  "Lead Source",       // → "Google Places"
-  "Lead Status",       // → "New"
-  "Industry",          // → "Healthcare"
-  "Description",       // → Agent Briefing (visible on lead open)
+  "Lead Source",
+  "Lead Status",
+  "Industry",
+  "Description",      // = Agent Briefing (agent sees this first on lead open)
 
-  // ── CUSTOM: 6 MULTI LINE (ordered by priority) ───────────────
-  "Cold Email Text",   // #1 — SUBJECT: ... \n --- \n 5-sentence email
-  "Call Script",       // #2 — 30-second opener
-  "Website Issues",    // #3 — Factual site problems with numbers
-  "Agent Briefing",    // #4 — WHO / PROBLEM / WE OFFER / BUDGET / CALL GOAL
-  "Pitch",             // #5 — Why call them + expected outcome
-  "Lead Recap",        // #6 — Score, Priority, Budget, Google, Site info
+  // Custom: 6 Multi Line fields
+  "Cold Email Text",  // #1 priority
+  "Call Script",      // #2
+  "Website Issues",   // #3
+  "Agent Briefing",   // #4
+  "Pitch",            // #5
+  "Lead Recap",       // #6 — instant, no AI
 ];
 
 function mapToZoho(pack) {
   const l = pack.lead     ?? {};
-  const a = pack.analysis ?? {};
-  const s = pack.site     ?? {};
   const e = pack.enriched ?? {};
 
   return {
@@ -64,28 +65,23 @@ function mapToZoho(pack) {
     "Lead Source": "Google Places",
     "Lead Status": "New",
     "Industry":    "Healthcare",
-    "Description": e.agent_briefing || "",  // agent sees this first when opening lead
+    "Description": e.agent_briefing || "",
 
-    // Custom: Multi Line (ordered by priority)
-    "Cold Email Text":  e.cold_email     || "",
-    "Call Script":      e.call_script    || "",
-    "Website Issues":   e.website_issues || "",
-    "Agent Briefing":   e.agent_briefing || "",
-    "Pitch":            e.pitch          || "",
-    "Lead Recap":       e.lead_recap     || "",
+    // Custom multi line
+    "Cold Email Text": e.cold_email     || "",
+    "Call Script":     e.call_script    || "",
+    "Website Issues":  e.website_issues || "",
+    "Agent Briefing":  e.agent_briefing || "",
+    "Pitch":           e.pitch          || "",
+    "Lead Recap":      e.lead_recap     || "",
   };
-}
-
-function capitalize(str) {
-  if (!str) return "";
-  return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
 function escapeCsv(value) {
   if (value === null || value === undefined) return "";
   const str = String(value);
   if (str.includes(",") || str.includes('"') || str.includes("\n") || str.includes("\r")) {
-    return `"${str.replace(/"/g, '""')}"`; 
+    return `"${str.replace(/"/g, '""')}"`;
   }
   return str;
 }
@@ -107,5 +103,5 @@ export async function mergeLeadPacksToCsv(packs, outputPath) {
   const header = ZOHO_COLUMNS.join(",");
   const rows   = packs.map(packToRow);
   fs.writeFileSync(outputPath, [header, ...rows].join("\n"), "utf8");
-  console.log(`📊 Zoho CSV (${packs.length} leads): ${outputPath}`);
+  console.log(`📊 Zoho CSV → ${outputPath} (${packs.length} leads)`);
 }

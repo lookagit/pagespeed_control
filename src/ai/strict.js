@@ -1,91 +1,152 @@
-// src/ai/strict.js – DeepSeek version with robust JSON extraction
-import { OpenAI } from 'openai';
-import { zodResponseFormat } from 'openai/helpers/zod';
-import "dotenv/config";
+// ============================================================
+// ai/strict.js — Robust JSON caller for DeepSeek
+// ============================================================
+// Uvek vraća parsed JSON ili baca grešku.
+// Pokušava direktni parse, pa fallback na brace extraction.
+// ============================================================
+import { deepseek, MODELS } from "./client.js";
 
-const deepseek = new OpenAI({
-  apiKey: process.env.DEEP_SEEK_API_KEY,
-  baseURL: 'https://api.deepseek.com/v1',
-});
-
-export const ENGINES = {
-  FAST: "deepseek-chat",
-  SMART: "deepseek-chat",
-  REASONING: "deepseek-reasoner",
-};
-
-/**
- * Attempts to extract a JSON object from a string that may contain extra text.
- * Finds the first '{' and the last '}' and returns the substring.
- * If no JSON object is found, returns null.
- */
 function extractJSON(str) {
-  const firstBrace = str.indexOf('{');
-  const lastBrace = str.lastIndexOf('}');
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
-    return null;
-  }
-  return str.substring(firstBrace, lastBrace + 1);
+  const first = str.indexOf("{");
+  const last  = str.lastIndexOf("}");
+  if (first === -1 || last === -1 || last < first) return null;
+  return str.substring(first, last + 1);
 }
 
 export async function callStrictJson({
-  schema,
-  schemaName,
   system,
   data,
-  model = ENGINES.FAST,
-  max_output_tokens = 800,
-  prompt_cache_key = `dentals:${schemaName}:v1`,
+  model           = MODELS.FAST,
+  max_tokens      = 900,
 }) {
-  const enhancedSystem = system + 
+  const enhancedSystem =
+    system +
     "\n\nRULES:\n" +
     "- Use ONLY the provided data. Do NOT invent facts.\n" +
-    "- You MUST output valid JSON matching the specified schema exactly.\n" +
-    "- The response must be pure JSON without any additional text or markdown.\n" +
-    `- Schema name: ${schemaName}\n` +
-    `- CACHE_KEY: ${prompt_cache_key}`;
+    "- Output ONLY valid JSON. No markdown, no explanation, no extra text.\n";
 
+  const response = await deepseek.chat.completions.create({
+    model,
+    messages: [
+      { role: "system", content: enhancedSystem },
+      { role: "user",   content: JSON.stringify(data) },
+    ],
+    max_tokens,
+    temperature:     0,
+    response_format: { type: "json_object" },
+  });
+
+  const content = response.choices[0]?.message?.content ?? "";
+  if (!content) throw new Error("Empty response from DeepSeek");
+
+  // 1. Direct parse
   try {
-    const response = await deepseek.chat.completions.create({
-      model: ENGINES.SMART,
-      messages: [
-        { role: "system", content: enhancedSystem },
-        { role: "user", content: JSON.stringify(data) }
-      ],
-      max_tokens: max_output_tokens,
-      temperature: 0,
-      response_format: { type: "json_object" },
-    });
-
-    const content = response.choices[0]?.message?.content;
-    console.log("WE ARE RESPONSE ", response.choices[0]?.message);
-    if (!content) {
-      throw new Error('Empty response from DeepSeek API');
+    return JSON.parse(content);
+  } catch {
+    // 2. Brace extraction fallback
+    const extracted = extractJSON(content);
+    if (!extracted) {
+      throw new Error(`No JSON found in response: ${content.slice(0, 300)}`);
     }
+    return JSON.parse(extracted);
+  }
+}
 
-    // First try direct parse
+// Convenience: plain text call (no JSON enforcement)
+// ai/strict.js (or wherever callText lives)
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * @param {object} args
+ * @param {string} args.prompt
+ * @param {number} [args.max_tokens=400]
+ * @param {number} [args.temperature=0.2]
+ * @param {number} [args.retries=2]
+ * @param {string} [args.model=MODELS.FAST]
+ * @param {(text:string)=>({ok:boolean, reason?:string}|boolean)} [args.validate]
+ * @param {string} [args.repair_instructions]
+ */
+export async function callText({
+  prompt,
+  max_tokens = 400,
+  temperature = 0.2,
+  retries = 2,
+  model = MODELS.FAST,
+  validate = null,
+  repair_instructions = null,
+}) {
+  let lastText = "";
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-        console.log('🔍 Attempting direct JSON parse...'. content);
-        const parsed = JSON.parse(content);
-        return parsed;
-    } catch (parseError) {
-      // If direct parse fails, attempt to extract JSON from the response
-      console.warn('⚠️ Direct JSON parse failed, attempting extraction...');
-      console.warn('Raw content (first 500 chars):', content.substring(0, 1111500));
+      const res = await deepseek.chat.completions.create({
+        model,
+        messages: [
+          // Keep it deterministic + no “assistant chatter”
+          { role: "system", content: "Return only the final answer. No markdown. No explanations." },
+          { role: "user", content: prompt },
+        ],
+        max_tokens,
+        temperature,
+      });
 
-      const extracted = extractJSON(content);
-      if (!extracted) {
-        throw new Error(`Could not extract JSON from response. Raw: ${content.substring(0, 22200)}...`);
+      const text = res.choices[0]?.message?.content?.trim() ?? "";
+      lastText = text;
+
+      // If no validator, return immediately
+      if (!validate) return text;
+
+      // Validate
+      const verdict = validate(text);
+      const ok = typeof verdict === "boolean" ? verdict : !!verdict?.ok;
+
+      if (ok) return text;
+
+      // If invalid and we still have attempts left, do a repair pass (same model)
+      const reason = typeof verdict === "object" ? verdict.reason : "Output did not match required format.";
+      if (attempt < retries) {
+        const repairPrompt = [
+          prompt,
+          "",
+          "IMPORTANT: Your previous output was invalid.",
+          `Reason: ${reason}`,
+          repair_instructions
+            ? `Repair instructions: ${repair_instructions}`
+            : "Repair instructions: Return ONLY the corrected output. Do not add commentary.",
+          "",
+          "Previous output (for reference):",
+          text,
+        ].join("\n");
+
+        // small backoff before repair attempt
+        await sleep(200 * (attempt + 1));
+        // overwrite prompt for next attempt
+        prompt = repairPrompt;
+        continue;
       }
 
-      const parsed = JSON.parse(extracted);
-      return parsed
-    }
+      // Out of attempts -> return best effort (or throw, depending on your preference)
+      return text;
 
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      throw new Error(`Failed to parse DeepSeek response as JSON: ${error.message}`);
+    } catch (err) {
+      const msg = err?.message ?? String(err);
+
+      // Retry transient errors
+      const transient =
+        /timeout|ETIMEDOUT|ECONNRESET|429|rate|temporarily|overloaded|5\d\d/i.test(msg);
+
+      if (attempt < retries && transient) {
+        await sleep(350 * (attempt + 1));
+        continue;
+      }
+
+      // Non-transient or out of retries
+      throw err;
     }
-    throw error;
   }
+
+  return lastText;
 }

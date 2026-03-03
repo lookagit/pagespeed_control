@@ -1,414 +1,335 @@
-// ============================================================
-// ai/enrichLead.js
-// ============================================================
-// Email strategija bazirana na istraživanju:
-//
-// ✅ Pod 80 reči (Instantly 2026: elite senders = 2-4x reply rate)
-// ✅ Timeline hook, ne problem hook (2.3x više reply-a vs problem)
-// ✅ Loss aversion opener (2.5x jači od gain framinga)
-// ✅ 3. razred čitljivosti (36% više odgovora)
-// ✅ Jedan CTA, binary YES/NO (micro-commitment princip)
-// ✅ Nema "I noticed", nema pozdrava, nema potpisa
-// ✅ Solo founder persona, ne agencija
-// ✅ Free PDF audit = reciprocity trigger
-// ✅ Case study = social proof (6.53% reply rate samo od social proof)
-// ✅ Konzervativni realni ROI (Google CWV data)
-//
-// Cilj: 10%+ reply rate (top 10% senders benchmark)
-// ============================================================
+// ai/enrichLead.js — Australian approach (English-only) — robust inputs
+import { callText } from "./strict.js";
+import { buildLeadPackFromCallReport } from "./prepareEnreachInputs.js";
 
-import OpenAI from "openai";
-import { CONFIG } from "../config.js";
+function str(v) { return v == null ? "" : String(v).trim(); }
+function num(v, f = 0) { const n = Number(v); return Number.isFinite(n) ? n : f; }
+function arr(v) { return Array.isArray(v) ? v : []; }
 
-const deepseek = new OpenAI({
-  apiKey:  CONFIG.DEEPSEEK_API_KEY,
-  baseURL: "https://api.deepseek.com",
-});
-
-async function ask(prompt, maxTokens = 350) {
-  const res = await deepseek.chat.completions.create({
-    model:       "deepseek-chat",
-    temperature: 0.4,
-    max_tokens:  maxTokens,
-    messages:    [{ role: "user", content: prompt }],
-  });
-  return res.choices[0]?.message?.content?.trim() ?? "";
+function parseUSCityState(address = "") {
+  const parts = String(address).split(",").map(s => s.trim()).filter(Boolean);
+  const city = parts[1] ?? "";
+  const stateZip = parts[2] ?? "";
+  const state = stateZip.split(/\s+/)[0] ?? "";
+  return { city, state };
 }
 
-// ─────────────────────────────────────────────────────────────
-// ROI HELPER — Google CWV istraživanje, konzervativni brojevi
-// Slow LCP (>2.5s) → 53% bounce vs 9% za brz sajt
-// ─────────────────────────────────────────────────────────────
 function calcRoi({ mPerf }) {
-  const visitors     = 200;
-  const slowBounce   = 0.53;
-  const fastBounce   = 0.09;
-  const conv         = 0.03;
-  const apptValue    = 350;
-  const fixCost      = 2500;
-  const maintCost    = 199;
+  const fixCost = 2500;
+  const maintCost = 199;
+  const lostVisitors = Math.round(200 * (0.53 - 0.09));
+  const lostAppts = Math.round(lostVisitors * 0.03);
+  const monthlyLost = lostAppts * 350;
+  const payback = monthlyLost > 0 ? Math.ceil(fixCost / monthlyLost) : 5;
+  return { fixCost, maintCost, monthlyLost, payback };
+}
 
-  const lostVisitors  = Math.round(visitors * (slowBounce - fastBounce));
-  const lostAppts     = Math.round(lostVisitors * conv);
-  const monthlyLost   = lostAppts * apptValue;
-  const payback       = monthlyLost > 0 ? Math.ceil(fixCost / monthlyLost) : 5;
+/**
+ * Deterministic primary issue selector:
+ * chooses ONE best sales angle across website + marketing/measurement + conversion.
+ * Avoids AI picking random/incorrect issues.
+ */
+function selectPrimaryIssue(callReport, analysis) {
+  // Prefer synthesis if present
+  const oneProblem = str(analysis?.the_one_problem);
+  const oneFix = str(analysis?.the_fix);
+  const oneCost = str(analysis?.the_one_problem_cost);
 
-  return { visitors, lostVisitors, lostAppts, monthlyLost, fixCost, maintCost, payback };
+  if (oneProblem) {
+    return {
+      problem: oneProblem,
+      fix: oneFix || "Fix it in ~2 weeks without changing what already works.",
+      cost: oneCost || "",
+    };
+  }
+
+  // Otherwise derive from raw facts
+  const v = callReport?.vitals_mobile ?? {};
+  const r = callReport?.resources_mobile ?? {};
+  const t = callReport?.tracking ?? {};
+  const mPerf = callReport?.scores?.mobile_perf;
+
+  if (v.fcp?.status === "poor" || v.tti?.status === "poor") {
+    const fcp = v.fcp?.value ? `blank screen for ${v.fcp.value}` : "a long blank screen";
+    const tti = v.tti?.value ? `buttons respond after ${v.tti.value}` : "buttons respond late";
+    return {
+      problem: `On phones, patients see a ${fcp} and ${tti}.`,
+      fix: "Speed tune-up: reduce heavy assets, simplify scripts, and make the page responsive within ~2 weeks.",
+      cost: "",
+    };
+  }
+
+  if (r.page_weight?.status === "poor" || r.requests?.status === "poor") {
+    const w = r.page_weight?.value ?? "a heavy page";
+    const req = r.requests?.value ?? "many requests";
+    return {
+      problem: `On mobile, the page loads ${w} across ${req} separate files, which slows down booking intent.`,
+      fix: "Performance cleanup: optimize images/assets and reduce page weight and file count in ~2 weeks.",
+      cost: "",
+    };
+  }
+
+  if (!t.has_ga4) {
+    return {
+      problem: "There’s no clear way to see how patients are finding you online (what marketing actually brings calls).",
+      fix: "Measurement setup: install proper visitor analytics and call/booking attribution in ~1 week.",
+      cost: "",
+    };
+  }
+
+  if (!callReport?.emails?.length) {
+    return {
+      problem: "There’s no visible email contact for patients who prefer to message instead of calling.",
+      fix: "Conversion cleanup: add a clear contact path and lightweight inquiry form in ~1 week.",
+      cost: "",
+    };
+  }
+
+  // Fallback
+  return {
+    problem: `Mobile experience could be improved (score ${mPerf ?? "unknown"}/100).`,
+    fix: "Quick performance + UX pass in ~2 weeks.",
+    cost: "",
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
-// 1. AGENT BRIEFING → Zoho: "Agent Briefing"
+// Generators (English-only)
 // ─────────────────────────────────────────────────────────────
-async function genAgentBriefing({ lead, leadPack, analysis, item }) {
-  const mPerf = item.scores?.mobile_perf  ?? "N/A";
-  const dPerf = item.scores?.desktop_perf ?? "N/A";
-  const name  = lead.name ?? lead.Company;
 
-  return await ask(`
-Write a short pre-call briefing for a sales agent. Max 5 lines.
+async function genColdEmail({ lead, analysis, site, item, leadPack }) {
+  const name = lead.name ?? lead.Company ?? "";
+  const { city, state } = parseUSCityState(item.address ?? lead.address ?? "");
+  const mPerf = item.scores?.mobile_perf ?? null;
+  const roi = calcRoi({ mPerf });
 
-Business: ${name} | ${item.address ?? ""}
-Website: ${item.website_url ?? lead.website_url}
-Mobile: ${mPerf}/100 | Desktop: ${dPerf}/100
-Priority: ${leadPack.priority?.toUpperCase()} | Score: ${leadPack.score}/100
-Top problems: ${analysis.problems.slice(0, 3).join("; ")}
-Quick wins: ${analysis.quick_wins.slice(0, 2).join("; ")}
-Budget: ${leadPack.estimated_budget}
+  const siteQuality = str(analysis?.site_quality_summary) || "Your site looks strong overall.";
+  const { problem, fix, cost } = selectPrimaryIssue(item, analysis);
 
-Exact format:
- WHO: <one sentence>
- PROBLEM: <biggest issue with numbers>
- WE OFFER: <one concrete solution>
- BUDGET: <estimate>
- CALL GOAL: <what to achieve>
-`, 250);
-}
+  // Only include $ cost if analysis explicitly provided it; otherwise keep it non-committal.
+  const costLine = cost ? cost : `a conservative estimate is ~$${roi.monthlyLost}/month in missed patients`;
 
-// ─────────────────────────────────────────────────────────────
-// 2. CALL SCRIPT → Zoho: "Call Script"
-// ─────────────────────────────────────────────────────────────
-async function genCallScript({ lead, leadPack, analysis, item }) {
-  const name = lead.name ?? lead.Company;
-  const city = item.address?.split(",")?.[1]?.trim() ?? "";
+  return await callText({
+    temperature: 0.2,
+    max_tokens: 450,
+    prompt: `Write a cold email to a dental practice. English only. You are a solo consultant (web + marketing + design), not an agency.
 
-  return await ask(`
-Write a 30-second cold call opener for a dental practice.
-
-Practice: ${name}, ${city}
-Main problem: ${analysis.problems[0]}
-Our offer: ${analysis.quick_wins[0]}
-Budget: ${leadPack.estimated_budget}
-
-3-4 sentences:
-- Who you are + specific reason you're calling this practice
-- One problem found on their site (with a number)
-- What you offer + open question
-
-Tone: peer-to-peer, not salesy. English.
-`, 280);
-}
-
-// ─────────────────────────────────────────────────────────────
-// 3. COLD EMAIL → Zoho: "Cold Email Text"
-//
-// NAUČNO OPTIMIZOVANO:
-// • Pod 80 reči (elite sender benchmark)
-// • Timeline hook (2.3x > problem hook)
-// • Loss aversion u S1 (2.5x jači od gain)
-// • Social proof case study u S2
-// • Reciprocity: besplatni PDF audit
-// • Micro-commitment CTA (binary YES/NO)
-// • 3. razred čitljivosti (36% više odgovora)
-// • Solo founder, nema "we"
-// ─────────────────────────────────────────────────────────────
-async function genColdEmail({ lead, analysis, site, item }) {
-  const name   = lead.name ?? lead.Company ?? "";
-  const city   = item.address?.split(",")?.[1]?.trim() ?? "";
-  const state  = item.address?.split(",")?.[2]?.trim()?.split(" ")?.[1] ?? "";
-  const mPerf  = item.scores?.mobile_perf  ?? null;
-  const dPerf  = item.scores?.desktop_perf ?? null;
-  const hasGa4 = item.tracking?.has_ga4        ?? false;
-  const hasGtm = item.tracking?.has_gtm        ?? false;
-  const hasPix = item.tracking?.has_meta_pixel ?? false;
-  const vitals = item.vitals_mobile ?? {};
-
-  // Najgori vital — hook broj
-  const priorityVitals = ["tbt", "tti", "lcp", "fcp"];
-  const worstVital     = priorityVitals
-    .map(k => vitals[k] ? { key: k.toUpperCase(), ...vitals[k] } : null)
-    .find(v => v?.status === "poor") ?? null;
-
-  const lcp = vitals.lcp?.value ?? null;
-
-  // Tracking gap — konkretan problem koji dentisti razumeju
-  const blindspot = !hasGa4 && !hasGtm
-    ? "no analytics — they can't see how many people visit and leave"
-    : !hasPix
-    ? "no Meta Pixel — visitors who don't call are gone forever, no retargeting"
-    : null;
-
-  const services = site.services?.slice(0, 2).join(" and ") || "dentistry";
-  const roi      = calcRoi({ mPerf });
-
-  // Koliko brzo možemo popraviti — timeline hook
-  const fixTimeline = "2 weeks";
-  const resultTimeline = "60 days";
-
-  return await ask(`
-You are writing a cold email as a SOLO web developer — one person, not an agency.
-You audit dental websites and fix them. That is your entire business.
-
-YOUR OFFER:
-- Free PDF audit (they keep it, no obligation)
-- Flat $${roi.fixCost} to fix + $${roi.maintCost}/month to maintain
-- No retainer. No contract. No sales call needed.
-
-PSYCHOLOGICAL FRAMEWORK (follow this exactly — it's based on research):
-
-1. TIMELINE HOOK (not problem hook — 2.3x higher reply rate):
-   Don't say "you have a problem." Say "I can fix X in Y weeks."
-   Research shows timeline framing outperforms problem framing 2.3x.
-   Example: "I can get ${name} from ${mPerf ?? 65}/100 to 90+ in ${fixTimeline}."
-
-2. LOSS AVERSION (2.5x stronger than gain framing):
-   Frame what they're LOSING NOW, not what they'll gain.
-   Use the dollar number: ~$${roi.monthlyLost}/month in missed patients.
-   People feel pain of loss 2.5x more than pleasure of gain.
-
-3. SOCIAL PROOF CASE STUDY (raises credibility, 53% positive reply rate):
-   One sentence. Similar practice, same region, specific result.
-   Example: "A ${services} practice in ${state} went from similar scores to 9 new patients/month in ${resultTimeline}."
-
-4. RECIPROCITY (free audit = obligation to respond):
-   Offer the PDF audit free. No strings. They keep it regardless.
-   This creates psychological obligation to at least reply.
-
-5. MICRO-COMMITMENT CTA (lowest friction possible):
-   "Want me to send it?" = binary YES/NO
-   Research: interest-based CTAs have 30% success rate vs 15% for meeting requests.
-   NEVER ask for a call, demo, or meeting in the first email.
-
-THEIR DATA (use exact numbers):
-Practice: ${name} | ${city}, ${state}
-Mobile score: ${mPerf ?? "unknown"}/100
-Desktop score: ${dPerf ?? "unknown"}/100
-LCP: ${lcp ?? "unknown"} ${lcp ? "(good = under 2.5s)" : ""}
-Worst vital: ${worstVital ? `${worstVital.key} at ${worstVital.value}` : "data unavailable"}
-Analytics: ${hasGa4 || hasGtm ? "OK" : "NONE — completely blind"}
-Meta Pixel: ${hasPix ? "OK" : "missing"}
-Blind spot: ${blindspot ?? "tracking looks fine"}
-Monthly revenue lost to slow site: ~$${roi.monthlyLost} (Google CWV research)
-Fix timeline: ${fixTimeline} | Results visible: ${resultTimeline}
-Services: ${services}
+AUSTRALIAN APPROACH (4 sentences total, under 80 words):
+S1: Genuine compliment + the ONE issue (with a number if available).
+S2: Credibility without fake proof: "We've fixed similar issues for other dental practices in ${state || "your area"}" — NO clinic names, NO invented results.
+S3: Offer a free 1-page PDF audit (theirs to keep).
+S4: Micro CTA: "Want me to send it?" (yes/no). No call ask.
 
 STRICT RULES:
-- UNDER 80 WORDS TOTAL (this is non-negotiable — elite senders use <80 words)
-- Write at 3rd-grade reading level (short words, short sentences)
-- NO greeting, NO sign-off
-- NO "I noticed", NO "I came across", NO "I hope"
-- NO "we" — you are ONE person
-- Every sentence = one idea, one number
-- End with YES/NO question only
-- Sound like a text from a smart friend, not a marketing email
+- Use only the facts below. If unclear, do not invent.
+- No jargon words: SEO, analytics, pixel, GTM, tag manager, Core Web Vitals, schema, canonical.
+- One issue only (do not list multiple).
 
-STRUCTURE (4 sentences max — brevity is the goal):
-S1: Timeline hook + loss number (what they're losing + how fast you can fix it)
-S2: Case study OR specific blind spot (one line, one fact)
-S3: Free PDF offer (reciprocity trigger)
-S4: Binary CTA ("Want me to send it?")
+FACTS:
+Practice: ${name}, ${city}${state ? `, ${state}` : ""}
+Website: ${item.website_url}
+What’s good: ${siteQuality}
+Primary issue: ${problem}
+What it may cost: ${costLine}
+Fix + timeline: ${fix}
+Mobile score (context): ${mPerf ?? "unknown"}/100
+Offer: Free PDF audit + optional $${roi.fixCost} fix + $${roi.maintCost}/mo maintenance
+Priority: ${String(leadPack?.priority || "").toUpperCase()} | Score: ${leadPack?.score ?? "n/a"}/100
 
-OUTPUT — return ONLY this:
-SUBJECT: <subject line>
+SUBJECT RULES:
+- Under 40 characters
+- Include a number
+- No question mark
+- Avoid "I noticed"
+
+OUTPUT ONLY:
+SUBJECT: <subject>
 ---
-<4 sentences, under 80 words>
-
-SUBJECT LINE:
-- Under 40 characters (37% higher open rate with short + number)
-- Loss framing or timeline framing — NOT curiosity gap
-- Must include a number
-- No question marks, no "I noticed"
-- Examples: "$${roi.monthlyLost}/mo — ${name}" or "${mPerf}/100 → 90 in 2 weeks" or "Fixed in ${fixTimeline}: ${name}"
-
-English. Brutally short. Every word earns its place.
-`, 500);
+<4 sentences, under 80 words>`,
+  });
 }
 
-// ─────────────────────────────────────────────────────────────
-// 4. WEBSITE ISSUES → Zoho: "Website Issues"
-// ─────────────────────────────────────────────────────────────
+async function genCallScript({ lead, analysis, item, leadPack }) {
+  const name = lead.name ?? lead.Company ?? "";
+  const { city, state } = parseUSCityState(item.address ?? "");
+  const { problem, fix, cost } = selectPrimaryIssue(item, analysis);
+
+  return await callText({
+    temperature: 0.2,
+    max_tokens: 220,
+    prompt: `Write a short call script (max 4 sentences) for a sales rep calling a dental practice. English only.
+
+Rules:
+- Start with a specific compliment.
+- Mention ONE issue in patient language (include a number if available).
+- Offer a fix + timeline (no price).
+- End with ONE open question.
+- No jargon.
+
+Facts:
+Practice: ${name}, ${city}${state ? `, ${state}` : ""}
+What’s good: ${str(analysis?.site_quality_summary) || "Site looks strong overall."}
+One issue: ${problem}
+Cost (if known): ${cost || "unclear"}
+Fix: ${fix}
+Priority: ${leadPack.priority} | Score: ${leadPack.score}/100
+
+Output only the script.`,
+  });
+}
+
+async function genAgentBriefing({ lead, analysis, item, leadPack }) {
+  const name = lead.name ?? lead.Company ?? "";
+  const { problem, fix, cost } = selectPrimaryIssue(item, analysis);
+
+  return await callText({
+    temperature: 0.2,
+    max_tokens: 220,
+    prompt: `Write a compact agent briefing (max 5 lines). English only.
+Format exactly:
+🏥 WHO: <1 sentence compliment>
+⚠️  ISSUE: <1 issue in patient terms, include number if possible>
+💡 FIX: <what we do + timeline>
+💰 BUDGET: <estimate or "unknown">
+🎯 GOAL: <what the agent should confirm>
+
+Facts:
+Practice: ${name}
+Mobile: ${item.scores?.mobile_perf ?? "N/A"}/100 | Desktop: ${item.scores?.desktop_perf ?? "N/A"}/100
+Priority: ${leadPack.priority.toUpperCase()} | Score: ${leadPack.score}/100
+What’s good: ${str(analysis?.site_quality_summary) || "Site looks strong overall."}
+One issue: ${problem}
+Cost: ${cost || "unclear"}
+Fix: ${fix}
+Budget estimate: ${leadPack.estimated_budget || "unknown"}`,
+  });
+}
+
 async function genWebsiteIssues({ analysis, item }) {
-  const mPerf       = item.scores?.mobile_perf ?? "N/A";
-  const mSeo        = item.scores?.mobile_seo  ?? "N/A";
-  const hasTracking = item.tracking?.has_ga4 || item.tracking?.has_gtm;
-  const hasBooking  = item.has_online_booking ?? false;
-  const cms         = item.tech_stack?.map(t => t.name)?.join(", ") || "unknown";
+  const mPerf = item.scores?.mobile_perf ?? "N/A";
+  const mSeo = item.scores?.mobile_seo ?? "N/A";
+  const { problem } = selectPrimaryIssue(item, analysis);
 
-  return await ask(`
-Write a factual 3-sentence CRM summary of this website's issues.
+  return await callText({
+    temperature: 0.2,
+    max_tokens: 150,
+    prompt: `Write exactly 3 sentences for a CRM note about this dental website. English only.
 
-Mobile: ${mPerf}/100 | SEO: ${mSeo}/100
-Analytics: ${hasTracking ? "Yes" : "No"} | Booking: ${hasBooking ? "Yes" : "No"}
-Stack: ${cms}
-Problems: ${analysis.problems.join(" | ")}
+Rules:
+- Dentist language, patient impact.
+- No jargon.
+- If 2 things are strong, say they are strong. Then mention ONE opportunity.
 
-Facts only. Numbers only. English.
-`, 160);
+Facts:
+Mobile score: ${mPerf}/100
+SEO score: ${mSeo}/100
+One opportunity: ${problem}
+
+Output: exactly 3 sentences.`,
+  });
 }
 
-// ─────────────────────────────────────────────────────────────
-// 5. PITCH → Zoho: "Pitch"
-// ─────────────────────────────────────────────────────────────
-async function genPitch({ lead, leadPack, analysis }) {
-  const name = lead.name ?? lead.Company;
+async function genPitch({ lead, analysis, leadPack, item }) {
+  const name = lead.name ?? lead.Company ?? "";
+  const { problem, fix, cost } = selectPrimaryIssue(item, analysis);
 
-  return await ask(`
-Write a 3-sentence internal pitch for why this dental practice is worth contacting.
+  // Internal pitch CAN mention service categories (marketing/design/web) but still keep it crisp.
+  return await callText({
+    temperature: 0.2,
+    max_tokens: 200,
+    prompt: `Write a 3-sentence INTERNAL sales pitch for the team. English only.
 
-Business: ${name} | Score: ${leadPack.score}/100 | Priority: ${leadPack.priority}
-Problems: ${analysis.problems.slice(0, 3).join(" | ")}
-Quick wins: ${analysis.quick_wins.join(" | ")}
-Budget: ${leadPack.estimated_budget}
+Goal: sell a package that can include web improvements, design/UX, and marketing measurement (as needed).
+Be honest if the site is good; frame as opportunity.
 
-S1: Why strong lead (problems = opportunity)
-S2: Top 2 things we fix
-S3: Expected outcome (ROI)
+Facts:
+Practice: ${name}
+Priority: ${leadPack.priority} | Score: ${leadPack.score}/100
+Website: ${item.website_url}
+Mobile perf: ${item.scores?.mobile_perf ?? "N/A"}/100 | Desktop perf: ${item.scores?.desktop_perf ?? "N/A"}/100
+One opportunity: ${problem}
+Cost: ${cost || "unclear"}
+Fix: ${fix}
 
-English. Internal use only.
-`, 220);
+S1: Why this is a real opportunity (honest)
+S2: What we do + timeline
+S3: Expected patient/lead outcome (conservative)
+
+Output only the pitch.`,
+  });
 }
 
-// ─────────────────────────────────────────────────────────────
-// 6. EMAIL SUBJECT — 3 angla, AI bira pobednika
-//    → Zoho: "Email Subject 1"
-//
-// Naučno: subject pod 40 karaktera + broj = 37% više otvaranja
-// Loss framing i timeline framing > curiosity za dentiste
-// ─────────────────────────────────────────────────────────────
-async function genEmailSubject({ lead, analysis, item }) {
-  const name   = lead.name ?? lead.Company ?? "";
-  const city   = item.address?.split(",")?.[1]?.trim() ?? "";
-  const mPerf  = item.scores?.mobile_perf  ?? null;
-  const vitals = item.vitals_mobile ?? {};
-  const lcp    = vitals.lcp?.value ?? null;
-  const roi    = calcRoi({ mPerf });
+function genLeadRecap({ lead, leadPack, item }) {
+  const mPerf = item.scores?.mobile_perf ?? null;
+  const roi = calcRoi({ mPerf });
 
-  const raw = await ask(`
-Write 3 cold email subject lines for a dental practice. Then pick the best.
-
-Practice: "${name}" | ${city}
-Mobile score: ${mPerf ?? "unknown"}/100
-LCP: ${lcp ?? "unknown"}
-Monthly revenue at risk: ~$${roi.monthlyLost}
-Fix time: 2 weeks
-
-RESEARCH RULES (based on 85M+ email analysis):
-- Under 40 characters = 37% higher open rate
-- Numbers in subject = 113% higher open rate
-- Loss framing > curiosity for B2B small business owners
-- Timeline framing = 2.3x higher reply rate
-- No question marks
-
-3 ANGLES:
-
-ANGLE 1 — LOSS + NUMBER (under 40 chars):
-Dollar amount they're losing. Specific. Hurts to read.
-Example: "$${roi.monthlyLost}/mo — ${name}"
-
-ANGLE 2 — TIMELINE + SCORE (under 40 chars):
-How fast you can fix it. Their exact score.
-Example: "${mPerf}/100 → 90 in 2 weeks"
-
-ANGLE 3 — SPECIFICITY (under 40 chars):
-Their worst metric. Feels handwritten.
-Example: "LCP ${lcp ?? "4.5s"} — fixable this month"
-
-Return ONLY:
-1: <subject>
-2: <subject>
-3: <subject>
-BEST: <1, 2, or 3>
-`, 120);
-
-  const lines    = raw.split("\n").map(l => l.trim()).filter(Boolean);
-  const subjects = {};
-  for (const line of lines) {
-    const m = line.match(/^([123]):\s*(.+)$/);
-    if (m) subjects[m[1]] = m[2].replace(/^["']|["']$/g, "").trim();
-  }
-  const bestLine = lines.find(l => /^BEST:/i.test(l));
-  const bestNum  = bestLine?.match(/BEST:\s*([123])/i)?.[1] ?? "1";
-
-  return subjects[bestNum] ?? subjects["1"] ?? "";
-}
-
-// ─────────────────────────────────────────────────────────────
-// 7. LEAD RECAP → Zoho: "Lead Recap"
-// ─────────────────────────────────────────────────────────────
-async function genLeadRecap({ lead, leadPack, item }) {
-  const website = item.website_url ?? lead.website_url ?? "";
-  const mPerf   = item.scores?.mobile_perf  ?? "N/A";
-  const dPerf   = item.scores?.desktop_perf ?? "N/A";
-  const temp    = item.lead_temperature?.label ?? "N/A";
-  const roi     = calcRoi({ mPerf: item.scores?.mobile_perf });
+  const orig = item._originalLead ?? lead ?? {};
+  const rating = orig?.rating ?? null;
+  const reviews = orig?.user_ratings_total ?? null;
+  const mapsUrl = orig?.maps_url ?? "";
 
   return [
-    `SCORE: ${leadPack.score}/100`,
-    `PRIORITY: ${(leadPack.priority || "").toUpperCase()}`,
-    `BUDGET: ${leadPack.estimated_budget || "unknown"}`,
-    `HEALTH: ${item.health_score ?? "N/A"}/100 (${item.health_grade ?? "?"})`,
-    `TEMP: ${temp}`,
-    `MOBILE PERF: ${mPerf}/100`,
-    `DESKTOP PERF: ${dPerf}/100`,
-    `MONTHLY LOST: ~$${roi.monthlyLost}`,
-    `PAYBACK: ${roi.payback} month${roi.payback !== 1 ? "s" : ""}`,
-    `FIX COST: $${roi.fixCost} + $${roi.maintCost}/mo`,
-    `WEBSITE: ${website}`,
-    `ADDRESS: ${item.address ?? "N/A"}`,
-    `SITE TONE: ${leadPack.site?.tone || "unknown"}`,
-    `SERVICES: ${(leadPack.site?.services || []).join(", ") || "unknown"}`,
-    `ANALYZED: ${leadPack.analyzed_at ? leadPack.analyzed_at.replace("T", " ").slice(0, 16) : ""}`,
-  ].join("\n");
+    `SCORE:         ${leadPack.score}/100`,
+    `PRIORITY:      ${String(leadPack.priority || "").toUpperCase()}`,
+    `BUDGET:        ${leadPack.estimated_budget || "unknown"}`,
+    `HEALTH:        ${item.health_score ?? "N/A"}/100 (${item.health_grade ?? "?"})`,
+    `MOBILE PERF:   ${item.scores?.mobile_perf ?? "N/A"}/100`,
+    `DESKTOP PERF:  ${item.scores?.desktop_perf ?? "N/A"}/100`,
+    `ROI (proxy):   ~$${roi.monthlyLost}/month | Payback ~${roi.payback} mo`,
+    rating ? `GOOGLE:        ${rating}★ (${reviews ?? "?"} reviews)` : "GOOGLE:        N/A",
+    mapsUrl ? `MAPS:          ${mapsUrl}` : null,
+    `WEBSITE:       ${item.website_url ?? lead.website_url ?? "N/A"}`,
+    `ADDRESS:       ${item.address ?? "N/A"}`,
+    `SITE TONE:     ${leadPack.site?.tone || "unknown"}`,
+    `SERVICES:      ${(leadPack.site?.services || []).join(", ") || "unknown"}`,
+    `ANALYZED:      ${leadPack.analyzed_at ? leadPack.analyzed_at.replace("T", " ").slice(0, 16) : ""}`,
+  ].filter(Boolean).join("\n");
 }
 
 // ─────────────────────────────────────────────────────────────
-// ORCHESTRATOR
+// ORCHESTRATOR (safe even if leadPack is missing)
 // ─────────────────────────────────────────────────────────────
-export async function enrichLead({ leadPack, analysis, item }) {
-  console.log("\n   🚀 Enrichment (7 AI calls + 1 recap)...");
+export async function enrichLead({ leadPack, analysis, item, siteSummary = null }) {
+  // If you accidentally call enrichLead({ item: callReport, analysis }), we recover:
+  if (!leadPack || typeof leadPack !== "object") {
+    if (!item) throw new Error("enrichLead() requires either leadPack or item (callReport).");
+    leadPack = buildLeadPackFromCallReport({ callReport: item, analysis, siteSummary });
+  }
+  if (!item) {
+    // If someone passed leadPack only, try to use leadPack.lead as item fallback
+    item = leadPack.lead ?? {};
+  }
 
   const lead = leadPack.lead;
   const site = leadPack.site;
+
   const enriched = {};
+  enriched.lead_recap = genLeadRecap({ lead, leadPack, item });
 
   const steps = [
-    { key: "agent_briefing", label: "Agent briefing", fn: () => genAgentBriefing({ lead, leadPack, analysis, item }) },
-    { key: "call_script",    label: "Call script",    fn: () => genCallScript({ lead, leadPack, analysis, item }) },
-    { key: "cold_email",     label: "Cold email",     fn: () => genColdEmail({ lead, analysis, site, item }) },
+    { key: "cold_email", label: "Cold email", fn: () => genColdEmail({ lead, analysis, site, item, leadPack }) },
+    { key: "call_script", label: "Call script", fn: () => genCallScript({ lead, analysis, item, leadPack }) },
+    { key: "agent_briefing", label: "Agent briefing", fn: () => genAgentBriefing({ lead, analysis, item, leadPack }) },
     { key: "website_issues", label: "Website issues", fn: () => genWebsiteIssues({ analysis, item }) },
-    { key: "pitch",          label: "Pitch",          fn: () => genPitch({ lead, leadPack, analysis }) },
-    { key: "email_subject",  label: "Email subject",  fn: () => genEmailSubject({ lead, analysis, item }) },
-    { key: "lead_recap",     label: "Lead recap",     fn: () => genLeadRecap({ lead, leadPack, item }) },
+    { key: "pitch", label: "Pitch", fn: () => genPitch({ lead, analysis, leadPack, item }) },
   ];
 
   for (const step of steps) {
     try {
-      console.log(`   ⏳ ${step.label}...`);
       enriched[step.key] = await step.fn();
-      console.log(`   ✅ ${step.label} done`);
     } catch (err) {
-      console.log(`   ⚠️  ${step.label} failed: ${err.message}`);
       enriched[step.key] = null;
     }
   }
 
   return {
     lead,
-    score:            leadPack.score,
-    priority:         leadPack.priority,
+    score: leadPack.score,
+    priority: leadPack.priority,
     estimated_budget: leadPack.estimated_budget,
-    analyzed_at:      leadPack.analyzed_at,
-    analysis:         leadPack.analysis,
-    site:             leadPack.site,
+    analyzed_at: leadPack.analyzed_at,
+    analysis: leadPack.analysis,
+    site: leadPack.site,
     enriched,
   };
 }
