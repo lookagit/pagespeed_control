@@ -5,8 +5,9 @@
 // Izlaz: out/{url-hash}.json za svaki lead
 //
 // Pokretanje:
-//   node src/index.js           - preskače već obrađene
-//   node src/index.js --force   - obrađuje sve iznova
+//   node src/index.js              - preskače već obrađene
+//   node src/index.js --force      - obrađuje sve iznova
+//   node src/index.js --concurrency 10  - broj paralelnih (default: 10)
 // ============================================================
 
 import fs from "fs";
@@ -104,13 +105,6 @@ function normalizeLead(row) {
 // CONTACT SUMMARY BUILDER
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Gradi finalni contact_summary od bogatih podataka iz collectContactDetails
- * i CSV leada. Uvek vraca konzistentan objekat, cak i pri partial/failed.
- *
- * @param {Object} lead          - normalizovani lead iz CSV-a
- * @param {Object|null} details  - rezultat collectContactDetails(), ili null
- */
 function buildContactSummary(lead, details) {
   const crawledPhones = details?.phones ?? [];
   const crawledEmails = details?.emails ?? [];
@@ -132,10 +126,7 @@ function buildContactSummary(lead, details) {
   return {
     phones:        allPhones,
     emails:        crawledEmails,
-    // Booking/kontakt CTA linkovi - "Request Appointment", "Book Now" itd.
-    // Svaki: { text, href, score, found_on }
     cta_links:     ctaLinks,
-    // Sta je nadjeno na kojoj stranici (za debug/audit)
     per_page:      details?.per_page ?? [],
     phones_count:  allPhones.length,
     emails_count:  crawledEmails.length,
@@ -151,66 +142,50 @@ function buildContactSummary(lead, details) {
 // ─────────────────────────────────────────────────────────────
 
 async function collectPageSpeed(url) {
-  console.log("  Pagespeed (mobile + desktop)...");
+  // mobile i desktop se vec pokrecu paralelno - dobro
   const [mobile, desktop] = await Promise.all([
     runPageSpeed({ url, strategy: "mobile",  apiKey: CONFIG.PSI_API_KEY }),
     runPageSpeed({ url, strategy: "desktop", apiKey: CONFIG.PSI_API_KEY }),
   ]);
-  console.log(`  Mobile: ${mobile.categories.performance} | Desktop: ${desktop.categories.performance}`);
   return { mobile, desktop };
 }
 
 async function collectSignalsData(url) {
-  console.log("  Signali (tracking, chatbot, booking, SEO)...");
-  const signals = await collectSignals(url);
-  const trackingCount = Object.values(signals.tracking ?? {}).filter(Boolean).length;
-  console.log(`  Chatbot: ${signals.chatbot?.vendor || "nema"} | Tracking: ${trackingCount} alata`);
-  return signals;
+  return await collectSignals(url);
 }
 
 async function collectContactData(url) {
-  console.log("  Kontakti & CTA linkovi...");
-  const details = await collectContactDetails(url);
-  console.log(`  Tel: ${details.phones.length} | Email: ${details.emails.length} | CTA: ${details.cta_links.length} linkova`);
-  return details;
+  return await collectContactDetails(url);
 }
 
 async function collectCrux(url) {
-  console.log("  CrUX (real-user podaci)...");
   try {
-    const crux = await getCrux({
+    return await getCrux({
       websiteUrl: url,
       apiKey: CONFIG.PSI_API_KEY,
       formFactor: "PHONE",
       includePage: false,
     });
-    console.log(`  CrUX: ${crux?.origin?.overall_category ?? "nema podataka"}`);
-    return crux;
-  } catch (e) {
-    console.log(`  CrUX nije dostupan: ${e.message}`);
+  } catch {
     return null;
   }
 }
 
 async function collectStack(url) {
-  console.log("  Stack detekcija...");
   try {
     const page  = await fetchHtmlWithHeaders(url);
-    const stack = {
+    return {
       fetched_from: page.finalUrl,
       status:       page.status,
       ...detectStack({ html: page.html, headers: page.headers }),
     };
-    console.log(`  CMS: ${stack.cms || "nepoznat"} | Server: ${stack.server || "nepoznat"}`);
-    return stack;
-  } catch (e) {
-    console.log(`  Stack detekcija neuspesna: ${e.message}`);
+  } catch {
     return null;
   }
 }
 
 // ─────────────────────────────────────────────────────────────
-// OBRADA JEDNOG LEADA
+// OBRADA JEDNOG LEADA — svi koraci paralelno gde je moguce
 // ─────────────────────────────────────────────────────────────
 
 function getOutputPath(lead) {
@@ -221,7 +196,6 @@ async function processLead(lead, options = {}) {
   const outputPath = getOutputPath(lead);
 
   if (!options.force && fs.existsSync(outputPath)) {
-    console.log(`  Preskocan (vec postoji). --force za ponovnu obradu.`);
     return { status: "skipped" };
   }
 
@@ -237,10 +211,12 @@ async function processLead(lead, options = {}) {
     processed_at:    new Date().toISOString(),
   };
 
-  // PageSpeed je kritican
+  const url = lead.website_url;
+
+  // ── PageSpeed je kritičan — mora uspeti ──────────────────
   try {
     result.pagespeed = await withRetries(
-      () => collectPageSpeed(lead.website_url),
+      () => collectPageSpeed(url),
       "PageSpeed",
       CONFIG.MAX_RETRIES
     );
@@ -252,46 +228,85 @@ async function processLead(lead, options = {}) {
     return { status: "failed" };
   }
 
-  // Signals: tracking, chatbot, booking, SEO
-  try {
-    result.signals = await withRetries(
-      () => collectSignalsData(lead.website_url),
-      "Signals",
-      CONFIG.MAX_RETRIES
-    );
-  } catch (e) {
+  // ── Signals, Contacts, CrUX, Stack — sve PARALELNO ──────
+  const [signalsResult, contactResult, cruxResult, stackResult] =
+    await Promise.allSettled([
+      withRetries(() => collectSignalsData(url),  "Signals",        CONFIG.MAX_RETRIES),
+      withRetries(() => collectContactData(url),  "ContactDetails", CONFIG.MAX_RETRIES),
+      collectCrux(url),
+      collectStack(url),
+    ]);
+
+  // Signals
+  if (signalsResult.status === "fulfilled") {
+    result.signals = signalsResult.value;
+  } else {
     result.status = "partial";
-    result.error  = `Signals failed: ${e.message}`;
+    result.error  = `Signals failed: ${signalsResult.reason?.message}`;
   }
 
-  // Contact details: phones, emails, CTA linkovi
+  // Contacts
   let contactDetails = null;
-  try {
-    contactDetails = await withRetries(
-      () => collectContactData(lead.website_url),
-      "ContactDetails",
-      CONFIG.MAX_RETRIES
-    );
-  } catch (e) {
-    if (!result.error) result.error = `ContactDetails failed: ${e.message}`;
+  if (contactResult.status === "fulfilled") {
+    contactDetails = contactResult.value;
+  } else {
+    if (!result.error) result.error = `ContactDetails failed: ${contactResult.reason?.message}`;
     if (result.status === "ok") result.status = "partial";
   }
 
   result.contact_summary = buildContactSummary(lead, contactDetails);
 
-  const cs = result.contact_summary;
-  console.log(
-    `  Kontakti: ${cs.phones_count} tel (${cs.phone_source}) | ${cs.emails_count} email | ${cs.cta_count} CTA | ${cs.pages_crawled} str.`
-  );
-
-  // CrUX i Stack su opcioni
-  result.crux  = await collectCrux(lead.website_url);
-  result.stack = await collectStack(lead.website_url);
+  // CrUX i Stack (opcioni — greška se tiho guta)
+  result.crux  = cruxResult.status  === "fulfilled" ? cruxResult.value  : null;
+  result.stack = stackResult.status === "fulfilled" ? stackResult.value : null;
 
   writeJson(outputPath, { item: result });
-  console.log(`  Sacuvano: ${outputPath}`);
 
   return { status: result.status };
+}
+
+// ─────────────────────────────────────────────────────────────
+// BATCH RUNNER — obrađuje N leadova paralelno
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Pokreće `tasks` (array async funkcija) sa maksimalno `concurrency`
+ * paralelnih izvršavanja u isto vreme. Koristi "sliding window" pattern
+ * umesto čekanja da ceo batch završi — uvek ima `concurrency` aktivnih.
+ */
+async function runWithConcurrency(tasks, concurrency) {
+  const results = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < tasks.length) {
+      const i = nextIndex++;
+      results[i] = await tasks[i]();
+    }
+  }
+
+  // Pokreni `concurrency` workera paralelno
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, worker);
+  await Promise.all(workers);
+
+  return results;
+}
+
+// ─────────────────────────────────────────────────────────────
+// PROGRESS TRACKER (thread-safe brojač za paralelne taskove)
+// ─────────────────────────────────────────────────────────────
+
+function makeProgress(total) {
+  let done = 0;
+  return {
+    tick(url, status) {
+      done++;
+      const pct = Math.round((done / total) * 100);
+      const icon = status === "failed" ? "✗" : status === "skipped" ? "→" : "✓";
+      process.stdout.write(`\r[${done}/${total}] ${pct}%  ${icon} ${url.slice(0, 60).padEnd(60)}`);
+      if (done === total) process.stdout.write("\n");
+    },
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -303,12 +318,17 @@ async function main() {
 
   ensureDir(CONFIG.OUT_DIR);
 
-  const args  = process.argv.slice(2);
-  const force = args.includes("--force") || args.includes("-f");
-  if (force) console.log("Force mode: ponavljam sve leadove\n");
+  // Parsiranje argumenata
+  const args        = process.argv.slice(2);
+  const force       = args.includes("--force") || args.includes("-f");
+  const concIdx     = args.findIndex(a => a === "--concurrency" || a === "-c");
+  const CONCURRENCY = concIdx !== -1 ? parseInt(args[concIdx + 1], 10) || 10 : 10;
+
+  if (force) console.log("Force mode: ponavljam sve leadove");
+  console.log(`Paralelnost: ${CONCURRENCY} leadova istovremeno\n`);
 
   const rows = readCsv(CONFIG.LEADS_CSV);
-  console.log(`Ucitano redova: ${rows.length}`);
+  console.log(`Učitano redova: ${rows.length}`);
 
   const leads  = [];
   const errors = [];
@@ -337,36 +357,45 @@ async function main() {
   }
 
   const toProcess = CONFIG.TEST_LIMIT > 0 ? leads.slice(0, CONFIG.TEST_LIMIT) : leads;
-  if (CONFIG.TEST_LIMIT > 0) console.log(`TEST MODE: obradjujem prvih ${toProcess.length}\n`);
+  if (CONFIG.TEST_LIMIT > 0) console.log(`TEST MODE: obrađujem prvih ${toProcess.length}`);
+
+  const total    = toProcess.length;
+  const progress = makeProgress(total);
+
+  console.log(`\nPokrećem obradu ${total} leadova (po ${CONCURRENCY} paralelno)...\n`);
+
+  const startTime = Date.now();
+
+  // Svaki lead = jedan task (lazy — ne pokreće se odmah)
+  const tasks = toProcess.map(lead => async () => {
+    const res = await processLead(lead, { force });
+    progress.tick(lead.website_url, res.status);
+    return res;
+  });
+
+  const results = await runWithConcurrency(tasks, CONCURRENCY);
+
+  const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
 
   let ok = 0, failed = 0, skipped = 0;
-  const total = toProcess.length;
-
-  for (let i = 0; i < total; i++) {
-    const lead = toProcess[i];
-    const pct  = Math.round(((i + 1) / total) * 100);
-
-    console.log("\n" + "-".repeat(60));
-    console.log(`[${i + 1}/${total}] ${pct}% -> ${lead.website_url}`);
-    console.log("-".repeat(60));
-
-    const res = await processLead(lead, { force });
-    if (res.status === "ok" || res.status === "partial") ok++;
-    else if (res.status === "failed") failed++;
+  for (const r of results) {
+    if (r.status === "ok" || r.status === "partial") ok++;
+    else if (r.status === "failed") failed++;
     else skipped++;
-
-    if (i < total - 1) await sleep(CONFIG.DELAY_MS);
   }
 
   console.log("\n" + "=".repeat(60));
-  console.log("STAGE 1 ZAVRSEN");
-  console.log(`   Uspesno: ${ok} | Neuspesno: ${failed} | Preskoceno: ${skipped}`);
-  console.log(`   Fajlovi: ${CONFIG.OUT_DIR}/`);
+  console.log("STAGE 1 ZAVRŠEN");
+  console.log(`   Uspešno:   ${ok}`);
+  console.log(`   Neuspešno: ${failed}`);
+  console.log(`   Preskočeno: ${skipped}`);
+  console.log(`   Vreme:     ${elapsed} min`);
+  console.log(`   Fajlovi:   ${CONFIG.OUT_DIR}/`);
   console.log("=".repeat(60));
-  console.log("\n Sledeci korak: node src/analyze_batch.js\n");
+  console.log("\n Sledeći korak: node src/analyze_batch.js\n");
 }
 
 main().catch(e => {
-  console.error("Fatalna greska:", e.message);
+  console.error("Fatalna greška:", e.message);
   process.exit(1);
 });

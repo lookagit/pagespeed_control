@@ -4,7 +4,7 @@ export const CONFIG = {
   FINAL_DIR: "./out/final",
   REPORT_DIR: "./out/report",
   DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY, 
-  LEADS_CSV: process.env.LEADS_CSV || "./out/kontakti/places_atl_midtown_dentists_200_dentist_dentist.csv",
+  LEADS_CSV: process.env.LEADS_CSV || "./out/kontakti/places_boston_back_bay_cosmetic_dentists_200_dentist_cosmetic_dentist.csv",
   PSI_API_KEY: process.env.PSI_API_KEY,
   CRUX_API_KEY: process.env.CRUX_API_KEY,
   OUT_DIR: "./out",

@@ -74,9 +74,10 @@ function mapToZoho(pack) {
 
   // Name split: normalizeLead() already split these correctly
   // For dental practices looksLikeBusiness → first="", last=name, company=name
-  const firstName = l.first_name ?? "";
-  const lastName  = l.last_name  ?? l.name ?? "";
+  // Zoho requires First Name — fall back to company name if empty
   const company   = l.company    ?? l.name ?? "";
+  const lastName  = l.last_name  ?? l.name ?? "";
+  const firstName = l.first_name || company || lastName;
 
   return {
     // ── Standard Zoho fields ─────────────────────────────
