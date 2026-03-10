@@ -1,19 +1,11 @@
-{
-  "locationName": "sydney_dentists",
-  "center": { "lat": -33.8688, "lng": 151.2093 },
-  "radius": 4000,
-  "keyword": "dentist",
-  "placeType": "dentist",
-  "targetCount": 150,
-  "grid": {
-    "steps": 3,
-    "latStep": 0.02,
-    "lngStep": 0.024
-  },
-  "delays": {
-    "betweenPoints": 3000,
-    "betweenDetails": 200,
-    "retryBase": 2200,
-    "overLimitBackoff": 5000
+  {
+    "locationName": "savski_venac_BIGZ_poslovne_zgrade",
+    "description": "BIGZ Business Centre, Bulevar Vojvode Mišića zona – 40.000m2 kancelarijskog prostora, banke, osiguranja, konsalting firme. Ozbiljna kantina i redovna nabavka.",
+    "center": { "lat": 44.7965, "lng": 20.4478 },
+    "radius": 1800,
+    "keyword": "poslovni konsalting",
+    "placeType": "establishment",
+    "targetCount": 150,
+    "grid": { "steps": 4, "latStep": 0.011, "lngStep": 0.013 },
+    "delays": { "betweenPoints": 2500, "betweenDetails": 200, "retryBase": 2200, "overLimitBackoff": 5000 }
   }
-}
