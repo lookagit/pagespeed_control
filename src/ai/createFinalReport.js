@@ -29,6 +29,7 @@
 
 import fs   from "fs";
 import path from "path";
+import { parseAddress } from "../utils/parseGoogleAddressUSA.js";
 
 const ZOHO_COLUMNS = [
   // Standard Zoho Leads
@@ -78,6 +79,7 @@ function mapToZoho(pack) {
   const company   = l.company    ?? l.name ?? "";
   const lastName  = l.last_name  ?? l.name ?? "";
   const firstName = l.first_name || company || lastName;
+  const address   = parseAddress(l.address ?? "");
 
   return {
     // ── Standard Zoho fields ─────────────────────────────
@@ -89,11 +91,11 @@ function mapToZoho(pack) {
     "Website":    l.website_url ?? "",       // normalizeLead key
 
     // Address — normalizeLead() correctly parsed these
-    "Street":     l.street      ?? "",
-    "City":       l.city        ?? "",
-    "State":      l.state       ?? "",
-    "Zip Code":   l.postal_code ?? "",
-    "Country":    l.country     || "USA",
+    "Street":     address.Street,
+    "City":       address.City,
+    "State":      address.State,
+    "Zip Code":   address["Zip Code"],
+    "Country":    address.Country,
 
     "Lead Source": "Google Places",
     "Lead Status": "New",
