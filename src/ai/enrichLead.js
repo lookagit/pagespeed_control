@@ -297,116 +297,183 @@ function cap(str) {
   return str ? str.charAt(0).toUpperCase() + str.slice(1) : str;
 }
 
-// ─────────────────────────────────────────────────────────────
-// ACT 1 — COLD EMAIL  (AI)
-//
-// FRAMEWORK: Connor Murray — "Who you are / Why relevant / What you want"
-//
-// PRINCIPLES:
-//   - 3 paragraphs, 4–6 sentences total, under 90 words
-//   - Paragraph 1: who you are + the team you're part of (1–2 sentences)
-//   - Paragraph 2: what priorities/challenges you work on that are
-//     relevant to THEM — specific to their role/industry (2–3 sentences)
-//   - Paragraph 3: assumptive close — "I'm looking to set some time"
-//     NOT "is this worth a chat" or "if you're interested"
-//   - Assumptive alignment: you expect this meeting to happen
-//   - Eliminate ALL passive language: no "worth a chat", no "if you're free",
-//     no "I was hoping", no "would love to"
-//   - Subject line: specific, under 40 chars, no question mark, no "I noticed"
-//   - Sign off: "Thanks in advance" — never "warmest regards" or "best"
-// ─────────────────────────────────────────────────────────────
+const SYSTEM_COLD_EMAIL =
+  "You are a solo web consultant writing cold emails to dental practice owners. "
+  + "You are one person on a small team — not an agency, not a platform.\n\n"
+  + "<absolute_rules>\n"
+  + "- Write how you talk. Informal. Contractions OK.\n"
+  + "- It's about THEM not you. No sentence starts with 'We'.\n"
+  + "- One issue only. One ask only.\n"
+  + "- No jargon: no SEO, PageSpeed, GTM, Core Web Vitals, pixel, analytics, schema.\n"
+  + "- No fake personalization: no 'congrats on the new location', no 'love what you're building'.\n"
+  + "- Banned phrases: 'worth a chat', 'if you're interested', 'I was hoping', 'would love to'.\n"
+  + "- Numbers stay in the PDF — email only hints at the finding.\n"
+  + "- Output only what's asked. No preamble. No commentary.\n"
+  + "</absolute_rules>";
+ 
  
 async function genColdEmail(F, N, leadPack, resolvedContacts) {
   const { state } = cityState(F.address);
+  const speedPhrase = F.speedLabel ?? "loads slower than patients expect on mobile";
  
-  const toneInstruction = (() => {
-    if (N.toneRegister === "peer")
-      return "Peer-to-peer. Two professionals. You're part of a team that supports practices like theirs. Not a vendor cold calling — a resource introducing themselves.";
-    if (N.toneRegister === "rescue")
-      return "Direct and warm. You're a team that works on this specific problem. You're offering to show them what you found.";
-    return "Helpful expert. You analyzed their site, you work on these problems, you're introducing your team.";
-  })();
- 
-  // Connor's framework: name what priorities/challenges you solve
-  // that are SPECIFIC to a dental practice — never generic
-  const relevantPriorities = (() => {
-    const list = [];
+  // ── PRE-COMPUTE (deterministic, zero AI cost) ─────────────
+  const problem = (() => {
     if (F.speedTier === "slow" || F.speedTier === "very_slow" || F.speedTier === "critical")
-      list.push("mobile load speed and patient drop-off before booking");
+      return `site ${speedPhrase}`;
     if (!F.hasGA4 && !F.hasGTM)
-      list.push("connecting marketing spend to actual new patient bookings");
+      return "no way to know which marketing is bringing patients in";
     if (F.seoProblem)
-      list.push("local search visibility for patients searching nearby");
+      return "patients nearby may not be finding them in search";
     if (!F.hasBooking)
-      list.push("after-hours appointment capture");
-    if (list.length === 0)
-      list.push("website performance and new patient conversion");
-    return list.slice(0, 2).join(" and ");
+      return "patients who find them after hours have no way to book";
+    return "website performance costing new patients before they reach booking";
   })();
  
-  return await callText({
-    temperature: 0.25,
-    max_tokens:  440,
+  const proof = (() => {
+    if (F.rating && F.rating >= 4.7 && F.reviewCount > 50)
+      return `${F.rating}★ across ${F.reviewCount} reviews`;
+    if (F.hasBooking && F.bookingVendor) return `${F.bookingVendor} booking`;
+    if (F.hasChatbot) return "after-hours chat";
+    if (F.mPerf >= 75)  return `strong desktop score (${F.dPerf}/100)`;
+    return null;
+  })();
+ 
+  // Structured facts block — same format every time, XML-tagged
+  const factsXml =
+    "<facts>\n"
+    + `  <practice>${F.name}${F.address ? ", " + F.address.split(",").slice(1,3).join(",").trim() : ""}</practice>\n`
+    + (F.rating ? `  <google>${F.rating}★ (${F.reviewCount ?? "?"} reviews)</google>\n` : "")
+    + `  <mobile>${F.mPerf ?? "unknown"}/100 — ${F.speedTier ?? "unknown"}</mobile>\n`
+    + `  <problem>${problem}</problem>\n`
+    + (proof ? `  <proof_of_research>${proof}</proof_of_research>\n` : "")
+    + `  <booking>${F.hasBooking ? (F.bookingVendor ?? "yes") : "none"}</booking>\n`
+    + `  <state>${state ?? "unknown"}</state>\n`
+    + "</facts>";
+ 
+  // ── P1: ANALYZE ───────────────────────────────────────────
+  // Job: one sentence — the human problem a patient would feel
+  // System: shared role + constraints
+  // User: facts only
+  // Prefill: forces answer format immediately
+ 
+  const p1 = await callText({
+    temperature: 0.0,
+    max_tokens: 60,
+    system: SYSTEM_COLD_EMAIL,
+    prefill: "The one thing a patient would notice: ",
     prompt:
-      // ── ROLE ──────────────────────────────────────────────
-      "You are writing a cold outreach email on behalf of a web performance team that works exclusively with dental practices.\n\n"
- 
-      // ── FRAMEWORK ─────────────────────────────────────────
-      + "FRAMEWORK (Connor Murray — Oracle #1 SDR, 2 years running):\n"
-      + "3 paragraphs. 4–6 sentences total. Under 90 words. No exceptions.\n\n"
-      + "PARAGRAPH 1 — WHO YOU ARE:\n"
-      + "  State your name, your company/team, and who you support.\n"
-      + "  Example pattern: 'My name is [NAME] and I'm part of the [team] at [company] responsible for supporting dental practices in [state].'\n"
-      + "  One to two sentences. No personalization gimmicks. No 'saw we went to the same school.'\n\n"
-      + "PARAGRAPH 2 — WHY YOU'RE RELEVANT:\n"
-      + "  Name the specific priorities and challenges your team works on that apply to THIS practice.\n"
-      + "  Relevant priorities for this practice: " + relevantPriorities + "\n"
-      + "  Describe at a high level how you solve them — what outcome you deliver for practices.\n"
-      + "  Two to three sentences. Industry-specific. Patient-language only — no technical jargon.\n"
-      + "  The goal: when they scan this paragraph they think 'that's actually relevant to us.'\n\n"
-      + "PARAGRAPH 3 — WHAT YOU WANT:\n"
-      + "  Assumptive close. You are LOOKING TO set up time — not asking if they'd be interested.\n"
-      + "  Propose two specific time options OR ask what their availability looks like.\n"
-      + "  End with: 'Thanks in advance, [NAME]'\n"
-      + "  NEVER: 'worth a chat', 'if you're interested', 'I was hoping', 'would love to', 'is this a priority'\n\n"
- 
-      // ── TONE ──────────────────────────────────────────────
-      + "TONE: " + toneInstruction + "\n\n"
- 
-      // ── RULES ─────────────────────────────────────────────
-      + "RULES (non-negotiable):\n"
-      + "• Assumptive alignment throughout — you expect this meeting to happen\n"
-      + "• Zero passive language — every sentence moves toward the meeting\n"
-      + "• No jargon: no SEO, PageSpeed, GTM, pixel, bounce rate, Core Web Vitals\n"
-      + "• Patient language only: 'patients searching on their phone', 'booking an appointment'\n"
-      + "• ONE issue only in paragraph 2. If multiple exist, pick the most impactful.\n"
-      + "• No fake personalization: no 'congrats on the new location', no 'saw your recent review'\n"
-      + "• If speed is mentioned: use ONLY this phrasing: \"" + (F.speedLabel ?? "loads slower than patients expect on mobile") + "\"\n"
-      + "• Numbers and PDF details are NOT in this email — that's what the meeting is for\n\n"
- 
-      // ── SUBJECT LINE ──────────────────────────────────────
-      + "SUBJECT LINE:\n"
-      + "Under 40 characters. Specific — reference something real about their practice or location.\n"
-      + "No question mark. No 'I noticed'. No 'quick note'.\n"
-      + "Good examples: 'Dr. Wood — mobile patients' / 'Santa Monica dental team intro' / 'Charles Wood, DDS — [team] intro'\n\n"
- 
-      // ── FACTS ─────────────────────────────────────────────
-      + "FACTS:\n"
-      + "Practice: " + F.name + (F.address ? ", " + F.address.split(",").slice(1, 3).join(",").trim() : "") + "\n"
-      + (F.rating ? "Google: " + F.rating + "★ (" + (F.reviewCount ?? "?") + " reviews)\n" : "")
-      + "Speed tier: " + (F.speedTier ?? "unknown") + (F.mPerf !== null ? ` (${F.mPerf}/100 mobile)` : "") + "\n"
-      + "Speed label: " + (F.speedLabel ?? "N/A") + "\n"
-      + "Primary issue: " + (F.oneProblem || "performance and conversion") + "\n"
-      + "Online booking: " + (F.hasBooking ? "yes" + (F.bookingVendor ? " via " + F.bookingVendor : "") : "not detected") + "\n"
-      + "Analytics: " + (F.hasGA4 || F.hasGTM ? "partial" : "none installed") + "\n"
-      + "State: " + (state || "unknown") + "\n\n"
- 
-      // ── OUTPUT FORMAT ─────────────────────────────────────
-      + "OUTPUT (nothing else — no preamble, no commentary):\n"
-      + "SUBJECT: <subject>\n"
-      + "---\n"
-      + "<3 paragraphs, 4–6 sentences, under 90 words, 'Thanks in advance, [NAME]' at end>",
+      "From these facts, identify the ONE problem a patient would actually feel.\n"
+      + "One sentence. Patient language. No jargon.\n\n"
+      + factsXml,
   });
+ 
+  // ── P2: DRAFT ─────────────────────────────────────────────
+  // Job: write the full email — 3 paragraphs, under 90 words
+  // Uses XML to separate: role context / analysis / structure / examples
+ 
+  const p2 = await callText({
+    temperature: 0.2,
+    max_tokens: 200,
+    system: SYSTEM_COLD_EMAIL,
+    prefill: "Hi [First Name],\n\n",
+    prompt:
+      "<task>Write a cold email to a dental practice owner.</task>\n\n"
+      + "<analysis>" + p1.trim() + "</analysis>\n\n"
+      + factsXml + "\n\n"
+      + "<structure>\n"
+      + "  P1 (1-2 sentences): who you are + specific proof you looked at them\n"
+      + "  P2 (2 sentences): the problem — what their patients experience\n"
+      + "  P3 (1 sentence, standalone): 'I put it in a one-pager — yours to keep, no strings. Want me to send it?'\n"
+      + "  Sign-off: 'Thanks in advance,' on its own line\n"
+      + "</structure>\n\n"
+      + "<examples>\n"
+      + "  <good_p2>Your site " + speedPhrase + " — that's likely costing you patients before they ever see what you offer.</good_p2>\n"
+      + "  <bad_p2>We analyzed your website and found performance issues affecting your conversion rate.</bad_p2>\n"
+      + "</examples>\n\n"
+      + "Under 90 words total. Fits on one phone screen.",
+  });
+ 
+  // ── P3: REVIEW ────────────────────────────────────────────
+  // Job: score the draft against 5 criteria
+  // Temperature 0.0 — scoring must be consistent
+  // Output: JSON scores + one note per failure
+ 
+  const p3 = await callText({
+    temperature: 0.0,
+    max_tokens: 150,
+    system: "You are a cold email quality reviewer. Output only valid JSON. No commentary.",
+    prefill: "{",
+    prompt:
+      "<task>Score this cold email draft. Output JSON only.</task>\n\n"
+      + "<draft>" + p2.trim() + "</draft>\n\n"
+      + "<criteria>\n"
+      + "  reader_focused: no sentence starts with 'We', all about their practice (0-10)\n"
+      + "  assumptive_cta: CTA expects yes, not asking if interested (0-10)\n"
+      + "  under_90_words: total word count under 90 (0-10)\n"
+      + "  human_tone: sounds like a person, not a template (0-10)\n"
+      + "  one_issue: only one problem mentioned (0-10)\n"
+      + "</criteria>\n\n"
+      + "Format: {\"scores\":{\"reader_focused\":N,\"assumptive_cta\":N,\"under_90_words\":N,\"human_tone\":N,\"one_issue\":N},\"fix\":\"one sentence on biggest issue or null\"}",
+  });
+ 
+  // Parse review — fallback gracefully if JSON breaks
+  let review = { scores: {}, fix: null };
+  try {
+    review = JSON.parse("{" + p3.trim());
+  } catch {
+    // If parse fails, skip refinement and use draft
+  }
+ 
+  const needsRefinement = review.fix !== null
+    && Object.values(review.scores).some(s => s < 7);
+ 
+  // ── P4: REFINE (conditional) ──────────────────────────────
+  // Only runs if review found issues
+  // Surgical fix — change as little as possible
+ 
+  const finalEmail = needsRefinement
+    ? await callText({
+        temperature: 0.2,
+        max_tokens: 200,
+        system: SYSTEM_COLD_EMAIL,
+        prefill: "Hi [First Name],\n\n",
+        prompt:
+          "<task>Fix ONLY the issue below in this email. Change as little as possible.</task>\n\n"
+          + "<draft>" + p2.trim() + "</draft>\n\n"
+          + "<fix_needed>" + (review.fix ?? "") + "</fix_needed>\n\n"
+          + "Keep everything else identical. Under 90 words total.",
+      })
+    : p2;
+ 
+  // ── P5: SUBJECT LINE ──────────────────────────────────────
+  // Dedicated step — subject line is high-leverage, deserves focus
+  // Slightly higher temp (0.3) — most creative step
+ 
+  const subject = await callText({
+    temperature: 0.3,
+    max_tokens: 30,
+    system: "Output only the subject line. Nothing else. No quotes.",
+    prefill: "",
+    prompt:
+      "<task>Write one subject line for this cold email.</task>\n\n"
+      + "<email>" + finalEmail.trim() + "</email>\n\n"
+      + "<rules>\n"
+      + "  - Under 40 characters\n"
+      + "  - Reference the doctor's name or city — something real\n"
+      + "  - No question mark\n"
+      + "  - No 'I noticed', no 'quick note', no 'one thing'\n"
+      + "  - Feels like it came from a human\n"
+      + "</rules>\n\n"
+      + "<examples>\n"
+      + "  <good>Dr. Wood — mobile patients</good>\n"
+      + "  <good>Santa Monica dental</good>\n"
+      + "  <bad>Quick note on your website</bad>\n"
+      + "  <bad>I noticed something</bad>\n"
+      + "</examples>\n\n"
+      + "Practice: " + F.name,
+  });
+ 
+  return `SUBJECT: ${subject.trim()}\n---\n${finalEmail.trim()}`;
 }
  
 
@@ -503,96 +570,240 @@ async function genAgentBriefing(F, N, leadPack, resolvedContacts) {
 // FRAMEWORK: Jordan Belfort — Straight Line Persuasion
 //
 // PRINCIPLES:
-//   - First 4 seconds: establish SHARP + ENTHUSIASTIC + EXPERT
-//     simultaneously — it comes through in tonality, not just words
-//   - Tonality carries 45% of communication — instructions embedded
-//     throughout so the agent knows HOW to say it, not just WHAT
-//   - Control = asking smart questions, letting THEM talk
-//     You gather intelligence — you don't pitch
-//   - Rapport = two elements:
-//     1. "They care about me" — empathetic tone, specific observation
-//     2. "They're just like me" — commonality, peer register
-//   - Enthusiasm is just below the surface — urgency in voice
-//     NOT yelling, NOT flailing — controlled energy
-//   - The sale is in the VALIDATION, not the pitch
+//   - First 4 seconds: project SHARP + ENTHUSIASTIC + EXPERT
+//     simultaneously — through tonality, not just words
+//     (45% tonality, 45% body language, 10% words)
+//   - Enthusiasm is just below the surface — urgency in voice.
+//     NOT excited. NOT flailing. Controlled energy.
+//   - Rapport = two things the prospect must feel:
+//     1. "This person cares about me" — empathetic tone, specific detail
+//     2. "They're like me" — peer register, earned compliment
+//   - Control = you ask smart questions, THEY talk.
+//     You gather intelligence. You don't pitch.
+//   - "You do the math" — let them calculate the loss themselves.
+//     Never tell them what to conclude.
+//   - The sale is in the VALIDATION question, not the pitch.
+//     Either answer works in your favor.
 // ─────────────────────────────────────────────────────────────
  
 function genCallScript(F, N) {
  
-  // ── BEAT 1: First 4 seconds — Sharp + Enthusiastic + Expert ──
-  // Tone instruction embedded. Agent must project all three
-  // simultaneously in the first breath.
+  // ── BEAT 1: First 4 seconds ───────────────────────────────
+  //
+  // Goal: establish all three simultaneously in the first breath.
+  //   SHARP      — you know exactly why you're calling
+  //   ENTHUSIASTIC — urgency just below the surface, not hype
+  //   EXPERT     — colleague reporting a finding, not a vendor selling
+  //
+  // What NOT to say:
+  //   ✗ "I was hoping to speak with..."  → weak, passive
+  //   ✗ "Do you have a minute?"          → gives them an exit
+  //   ✗ "I just wanted to..."            → undermines authority
+  // ─────────────────────────────────────────────────────────
   const beat1 = (() => {
-    const location = F.address ? F.address.split(",").slice(1, 2).join("").trim() : "the area";
+    const { city, stateCode } = extractLocation(F.address);
+    const location = city || stateCode || "the area";
+ 
     return (
-      `Hi, I'm [Name] — `
-      + `I was looking at dental practices in ${location} and spent some time on the ${F.name} website. `
-      + `[TONE: calm + confident + slight urgency — like a colleague reporting a finding, not a vendor selling]`
+      `Hi, may I speak with Dr. ${F.doctorName ?? "[Name]"} — `
+      + `my name is [NAME]. `
+      + `We analyze website performance for dental practices in ${location}, `
+      + `and I was looking at the ${F.name} site — `
+      + `I noticed something specific that's likely affecting your new patient flow. `
+      + `\n[TONE: calm + measured + slight urgency beneath the surface. `
+      + `Sound like a colleague who found something, not a vendor who wants to sell something. `
+      + `Pacing: don't rush. The confidence is in the pace.]`
     );
   })();
  
-  // ── BEAT 2: Rapport — earned compliment, specific detail ──
-  // Must feel like you actually looked. Vague = ignored.
-  // "I'm just like you" element — you recognize quality.
+  // ── BEAT 2: Rapport — earned, specific, peer-to-peer ─────
+  //
+  // Belfort rule: rapport is NOT flattery.
+  // Rapport is two things:
+  //   "They care about me"  → you noticed real things about their practice
+  //   "They're like me"     → peer register, you recognize quality
+  //
+  // Must use real data. Vague = they know you didn't look.
+  // Specific = they believe everything else you say.
+  // ─────────────────────────────────────────────────────────
   const beat2 = (() => {
     const signals = [];
-    if (F.rating && F.rating >= 4.5)
-      signals.push(`${F.rating}★ on Google with ${F.reviewCount ?? "solid"} reviews — you've clearly built something patients trust`);
-    if (F.hasBooking && F.bookingVendor)
-      signals.push(`online booking through ${F.bookingVendor} is set up`);
-    if (F.hasChatbot)
-      signals.push(`after-hours chat is running`);
-    if (F.mPerf && F.mPerf >= 70)
-      signals.push(`the site is technically solid`);
  
+    if (F.rating && F.rating >= 4.5 && F.reviewCount)
+      signals.push(
+        `${F.rating} stars on Google with ${F.reviewCount} reviews — `
+        + `that kind of reputation takes real work to build`
+      );
+    else if (F.rating && F.rating >= 4.0)
+      signals.push(`solid ${F.rating}-star reputation on Google`);
+ 
+    if (F.hasBooking && F.bookingVendor)
+      signals.push(`you've got online booking through ${F.bookingVendor} running`);
+    else if (F.hasBooking)
+      signals.push(`online booking is already set up`);
+ 
+    if (F.hasChatbot)
+      signals.push(`the after-hours chat is live`);
+ 
+    if (F.dPerf && F.dPerf >= 85 && (!F.mPerf || F.mPerf < 70))
+      signals.push(`the desktop site is technically clean — ${F.dPerf}/100`);
+ 
+    // Build the compliment — always 2 specifics if possible
     const praise = signals.length >= 2
-      ? signals.slice(0, 2).join(", ") + " — that's more than most practices have"
+      ? `${cap(signals[0])}, and ${signals[1]} — honestly, that's more set up than most practices in the area`
       : signals.length === 1
-      ? signals[0]
-      : cap(F.siteQuality || "the practice clearly invests in its online presence");
+      ? cap(signals[0])
+      : cap(F.siteQuality || `the practice clearly has the fundamentals in place`);
  
     return (
-      cap(praise) + ". "
-      + `That's exactly why I kept looking. And that's why one thing stood out. `
-      + `[TONE: genuine — not flattery, not a pitch setup. You mean it. They feel it.]`
+      praise + `. `
+      + `That's exactly why what I found stood out. `
+      + `\n[TONE: genuine — you mean every word. This is not a setup line. `
+      + `Not flattery. They will feel the difference. `
+      + `Slow down slightly on the compliment — let them receive it.]`
     );
   })();
  
-  // ── BEAT 3: The one thing — visual, patient-language, certain ──
-  // Tonality: certainty. This is not an opinion. You measured it.
-  // Slow down on the key number/phrase. Let it land.
+  // ── BEAT 3: The one thing — visual, patient-language ──────
+  //
+  // Belfort: "certainty tone" — this is not an opinion.
+  // You measured it. You're reporting it.
+  //
+  // Patient language, not tech language:
+  //   ✗ "mobile performance score is below average"
+  //   ✓ "blank white screen for 15 seconds before anything loads"
+  //
+  // "You do the math" principle:
+  //   State the fact. State the patient behavior. Let THEM calculate the loss.
+  //   Don't tell them what it costs — let them feel it themselves.
+  // ─────────────────────────────────────────────────────────
   const beat3 = (() => {
     const tension = N.tensionSentence;
-    const impact  = F.oneCost
-      ? F.oneCost
-      : F.speedTier === "slow" || F.speedTier === "very_slow" || F.speedTier === "critical"
-      ? "likely 3 to 5 patients a month who leave before they ever see your services"
-      : null;
+ 
+    // Patient cost — either from analysis or derived from speed tier
+    const patientCost = F.oneCost
+      || (
+        (F.speedTier === "slow" || F.speedTier === "very_slow" || F.speedTier === "critical")
+          ? `likely 3 to 5 patients a month who give up before they even see what you offer`
+          : null
+      );
+ 
+    const mathLine = patientCost
+      ? `That's ${patientCost}. You do the math on what each new patient is worth. `
+      : ``;
  
     return (
-      tension + " "
-      + (impact ? `${cap(impact)}. ` : "")
-      + `I put the specifics in a short one-pager. `
-      + `[TONE: certainty — measured, not estimated. Slow down on the key number. Full stop. Let it land.]`
+      tension + ` `
+      + mathLine
+      + `I put together a one-page breakdown of exactly what's causing it and what a fix looks like. `
+      + `\n[TONE: certainty. Slow down on the key number or phrase. `
+      + `Full stop after the patient cost. `
+      + `Let it land. Do NOT rush past it to the PDF offer. `
+      + `The silence after that number is working for you.]`
     );
   })();
  
-  // ── BEAT 4: Low-pressure reframe ──
-  // Removes sales pressure. Positions PDF as a gift, not a hook.
-  const beat4 = `The PDF is theirs to keep — not a pitch, just what we found. [TONE: relaxed, matter-of-fact]`;
- 
-  // ── BEAT 5: Validation question — gather intelligence ──
-  // This is where you STOP TALKING and LISTEN.
-  // The question confirms the pain — it doesn't introduce it.
-  // Either answer works in your favor.
-  const beat5 = (
-    N.cta.call
-    + ` [TONE: genuine curiosity — you're confirming what you saw, not pitching. STOP. LISTEN. Do not fill the silence.]`
+  // ── BEAT 4: Micro-yes — remove all pressure ───────────────
+  //
+  // Belfort: "reasonable man" tone.
+  // This is the obviously sensible next step. Not a pitch. Not an ask.
+  // The PDF is a gift. They can take it or leave it.
+  // The micro-yes is: just an email address. That's it.
+  // ─────────────────────────────────────────────────────────
+  const beat4 = (
+    `It's one page — what the issue is, what it's costing, and what a fix looks like. `
+    + `Yours to keep, no obligation. `
+    + `I can send it to ${F.crawlerEmails?.[0] ?? "[their email]"} — `
+    + `or whatever address works best for you. `
+    + `\n[TONE: matter-of-fact. "Reasonable man" register — `
+    + `this is just the obvious next step, not a pitch. `
+    + `Not excited. Not urgent. Just sensible. `
+    + `Pause after "no obligation" — let the low pressure land.]`
   );
  
-  return [beat1, beat2, beat3, beat4, beat5].join("\n\n");
+  // ── BEAT 5: Validation question — gather intelligence ─────
+  //
+  // Belfort: this is where you STOP TALKING.
+  // The question does NOT introduce the problem — it confirms it.
+  // Either answer moves you forward:
+  //   "Yes, we've noticed" → pain confirmed, they're sold
+  //   "No, we haven't"    → you're the expert who saw what they missed
+  //
+  // The silence after the question is the most important moment.
+  // ─────────────────────────────────────────────────────────
+  const beat5 = (
+    N.cta.call
+    + ` `
+    + `\n[TONE: genuine curiosity. You're not closing. You're confirming. `
+    + `ASK THE QUESTION. STOP. `
+    + `Do not fill the silence. `
+    + `Do not add "...or would you prefer email?" `
+    + `The first person who speaks loses. Let it be them.]`
+  );
+ 
+  // ── OBJECTIONS ────────────────────────────────────────────
+  //
+  // Belfort: every objection is a buying signal in disguise.
+  // Don't fight it. Acknowledge it. Reframe it. Move forward.
+  // Micro-yes: all roads lead to "can I send you the PDF?"
+  // ─────────────────────────────────────────────────────────
+  const objections = buildObjectionSection(F);
+ 
+  return [beat1, beat2, beat3, beat4, beat5, objections].join("\n\n");
 }
  
+ 
+// ── HELPERS ───────────────────────────────────────────────────
+ 
+function extractLocation(address) {
+  if (!address) return { city: null, stateCode: null };
+  const parts = String(address).split(",").map(s => s.trim()).filter(Boolean);
+  const city      = parts[1] ?? null;
+  const stateCode = parts[2] ? parts[2].trim().split(/\s+/)[0] : null;
+  return { city, stateCode };
+}
+ 
+function buildObjectionSection(F) {
+  const email = F.crawlerEmails?.[0] ?? "[their email]";
+ 
+  const base = [
+    `── OBJECTIONS ─────────────────────────────────────────────`,
+    ``,
+    `"No time right now"`,
+    `→ "Completely understood — that's exactly why I'm sending it written.`,
+    `   Look at it when it suits you. Which email should I use?"`,
+    `   [TONE: unfazed. This is still the reasonable next step.]`,
+    ``,
+    `"Who are you exactly?"`,
+    `→ "Good question — we analyze web performance for dental practices across the area.`,
+    `   Your site came up in our data and the number was specific enough that I wanted to flag it directly."`,
+    `   [TONE: confident, not defensive. You expected the question. You have the answer.]`,
+    ``,
+    `"We already have someone for the website"`,
+    `→ "That's great — means you have the infrastructure. This is one specific issue with mobile speed.`,
+    `   I can send the PDF so you or your team can take a look — sometimes it's a quick fix`,
+    `   once someone knows exactly where to look."`,
+    `   [TONE: collaborative, not competitive. You're helping their team, not replacing it.]`,
+  ];
+ 
+  // Budget objection only added if budget is lower tier
+  if (F.budget && (F.budget.includes("1k") || F.budget.includes("3k"))) {
+    base.push(
+      ``,
+      `"Not spending on the website right now"`,
+      `→ "Totally fair — the PDF is free. No pitch, just the data.`,
+      `   You decide if and when it's worth acting on. Can I send it to ${email}?"`,
+      `   [TONE: zero pressure. You're leaving the door open, not blocking it.]`
+    );
+  }
+ 
+  return base.join("\n");
+}
+ 
+function cap(str) {
+  if (!str) return str;
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
 
 // ─────────────────────────────────────────────────────────────
 // WEBSITE ISSUES  (deterministic, internal CRM use)
